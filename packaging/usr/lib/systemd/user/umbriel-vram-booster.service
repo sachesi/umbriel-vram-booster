@@ -1,0 +1,45 @@
+[Unit]
+Description=Umbriel VRAM Booster - dynamic dmem cgroup prioritization for the focused app
+After=dmemcg-booster.service
+Wants=dmemcg-booster.service
+
+[Service]
+Type=dbus
+BusName=org.umbriel.VramBooster
+ExecStart=/usr/bin/umbriel-vram-booster
+Environment=RUST_LOG=warn
+# VRAM_BOOST_RATIO=0.90  # uncomment to override (0.0-1.0)
+
+Restart=on-failure
+RestartSec=3
+
+# Hardening. Runs as the session user (not root); dmem.low files under this
+# user's user@<uid>.service subtree are user-owned, so no capabilities are
+# needed to write them. Must preserve: reading /proc/<pid>/cgroup,
+# /proc/<pid>/task/*/children and /proc/<pid>/environ, writing
+# /sys/fs/cgroup/**/dmem.low, and connecting to the Umbriel IPC socket under
+# $XDG_RUNTIME_DIR (AF_UNIX).
+#
+# Deliberately NOT set, would break required access:
+#   ProtectControlGroups=true  -> /sys/fs/cgroup read-only, kills dmem.low writes
+#   ProtectKernelTunables=true -> /sys read-only, breaks dmem.low writes
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/sys/fs/cgroup
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=default.target
