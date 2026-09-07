@@ -2,7 +2,7 @@
 %global debug_package %{nil}
 
 Name:           umbriel-vram-booster
-Version:        0.2.0
+Version:        0.2.1
 Release:        1%{?dist}
 Summary:        VRAM priority for the focused window on the Umbriel compositor
 
@@ -73,5 +73,8 @@ install -Dpm0644 packaging/usr/lib/systemd/user/%{name}.service \
 %{_userunitdir}/%{name}.service
 
 %changelog
+* Mon Sep 07 2026 sachesi <xsachesi@pm.me> - 0.2.1-1
+- Drop ProtectHome from the unit; it hid the session bus
+
 * Mon Sep 07 2026 sachesi <xsachesi@pm.me> - 0.2.0-1
 - Initial package

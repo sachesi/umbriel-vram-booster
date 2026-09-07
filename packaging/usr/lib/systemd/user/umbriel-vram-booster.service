@@ -24,11 +24,13 @@ RestartSec=3
 #   ProtectControlGroups=true  -> /sys/fs/cgroup read-only, kills dmem.low writes
 #   ProtectKernelTunables=true -> /sys read-only, breaks dmem.low writes
 #   ProtectProc=invisible      -> system services only, ignored in a user manager
+#   ProtectHome=true           -> empties /run/user as well as /home, which
+#                                 hides both the session bus and the Umbriel
+#                                 socket; the daemon cannot start with it
 # ReadWritePaths stays the whole cgroup tree: the daemon itself refuses any
 # cgroup outside this user's own user-<uid>.slice.
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=true
 ReadWritePaths=/sys/fs/cgroup
 ProtectKernelModules=true
 ProtectKernelLogs=true

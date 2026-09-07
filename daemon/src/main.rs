@@ -465,8 +465,11 @@ async fn main() {
     let _conn = match conn {
         Ok(builder) => match builder.build().await {
             Ok(c) => c,
+            Err(zbus::Error::NameTaken) => {
+                die("org.umbriel.VramBooster is already taken: another instance is running")
+            }
             Err(e) => die(&format!(
-                "cannot take org.umbriel.VramBooster on the session bus: {e}. Is another instance running?"
+                "cannot reach the session bus: {e}. Is $XDG_RUNTIME_DIR reachable? A sandbox setting that hides /run/user, such as ProtectHome=, looks like this."
             )),
         },
         Err(e) => die(&format!("cannot set up the session bus connection: {e}")),
