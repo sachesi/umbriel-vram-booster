@@ -30,7 +30,10 @@ systemctl --user enable --now dmemcg-booster.service
 
 The daemon speaks Umbriel's IPC socket. A build that reports `pid` in `umbriel windows --json` (PR #166) resolves native Wayland windows exactly; an older build falls back to app id matching for everything.
 
-**4. Rust toolchain and just**
+**4. Rust toolchain and just — on the build machine only**
+
+Rust 1.88 or newer (the code uses let-chains). The machine you install on needs
+neither: `just install` copies binaries and never compiles.
 
 ```
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh

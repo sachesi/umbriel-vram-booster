@@ -4,7 +4,7 @@
 
 The focused window receives VRAM priority (`dmem.low` set to VRAM × boost_ratio, default 90%). All other apps are set to zero. When focus switches, the previous app is reverted and the new one is boosted. Only apps with a systemd unit under `app.slice` can be boosted — see below.
 
-The boost ratio prevents starving the compositor and other GPU consumers. Override via the `VRAM_BOOST_RATIO` environment variable in the systemd user service:
+The boost ratio prevents starving the compositor and other GPU consumers. Override it in the systemd user service, not by running a second copy of the daemon by hand: the running instance owns the bus name, so a second one exits without doing anything.
 
 ```
 systemctl --user edit umbriel-vram-booster.service
@@ -30,13 +30,22 @@ Example output:
 ```
 === Umbriel VRAM Booster Status ===
 Daemon:           running
+Following:        /run/user/1000/umbriel-wayland-1.sock
 DRM key:          drm/0000:2d:00.0/vram
 VRAM total:       8573157376 (8176 MiB, 7.98 GiB)
 Boost ratio:      90%
-Boosted bytes:    7715841638 (7360 MiB, 7.19 GiB) (90% of total)
+Boosted bytes:    7715841638 (7358 MiB, 7.19 GiB)
 Current unit:     app-flatpak-org.mozilla.firefox-1126565164.scope
-Boosted cgroup:   (none)
+Boosted cgroup:   /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-org.mozilla.firefox-1126565164.scope
 ```
+
+`Following` is the Umbriel socket the daemon is reading. `(not connected -
+waiting for Umbriel)` means it has none yet: the compositor is not up, or its
+socket is not where the daemon looks (see Troubleshooting). `Current unit` and
+`Boosted cgroup` are the same cgroup, by unit name and by full path; both are
+`(none)` when nothing is boosted.
+
+`--help` and `--version` are the only arguments it takes.
 
 Running `umbriel-vram-boosterctl` from a terminal shows the terminal's own state, because the terminal is the active window. Focus the app you care about first, e.g. `sleep 5; umbriel-vram-boosterctl` and click over within 5 s.
 
@@ -118,11 +127,13 @@ Some editors use a daemon model — the first launch starts a background process
 
 **Daemon not following focus**
 
+Run `umbriel-vram-boosterctl` first: if `Following` shows a socket, the daemon is connected and the problem is the app, not the connection. Otherwise:
+
 ```
 journalctl --user -u umbriel-vram-booster -b --no-pager | tail
 ```
 
-`no Umbriel socket` means neither `UMBRIEL_SOCKET` nor `WAYLAND_DISPLAY` reached the user manager and no `umbriel-*.sock` exists in `$XDG_RUNTIME_DIR`. `cannot connect` means the socket path exists but Umbriel is not listening. Both retry every 3 s. To pin the socket:
+`no Umbriel socket` means neither `UMBRIEL_SOCKET` nor `WAYLAND_DISPLAY` reached the user manager and no `umbriel-*.sock` exists in `$XDG_RUNTIME_DIR`. `cannot connect` means the socket path exists but Umbriel is not listening. Both retry, starting at 3 s and backing off to 60 s, so a session that starts Umbriel late may take up to a minute to be picked up. To pin the socket:
 
 ```
 systemctl --user edit umbriel-vram-booster.service
