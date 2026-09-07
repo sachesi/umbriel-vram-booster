@@ -2,6 +2,7 @@
 //! whose pid Umbriel cannot report (X11 through xwayland-satellite).
 
 use std::fs;
+use std::time::Instant;
 use tracing::warn;
 
 use crate::cgroup::{read_trimmed, unit_label};
@@ -88,11 +89,18 @@ pub(crate) fn environ_has_game_id(environ: &[u8], id: &str) -> bool {
 /// True if any process in the unit runs with `id` as its Steam/umu game id.
 /// Links a leyen/umu scope named after an internal uuid to the window's
 /// `steam_app_<id>` class.
-pub(crate) fn unit_env_has_game_id(unit_dir: &std::path::Path, id: &str) -> bool {
+pub(crate) fn unit_env_has_game_id(
+    unit_dir: &std::path::Path,
+    id: &str,
+    deadline: Instant,
+) -> bool {
     let Ok(procs) = fs::read_to_string(unit_dir.join("cgroup.procs")) else {
         return false;
     };
     procs.lines().take(256).any(|pid| {
+        if Instant::now() >= deadline {
+            return false;
+        }
         fs::read(format!("/proc/{pid}/environ"))
             .map(|env| environ_has_game_id(&env, id))
             .unwrap_or(false)
@@ -116,8 +124,11 @@ pub(crate) fn app_unit_core(unit: &str) -> Option<String> {
         },
     };
     let mut core = core.split('@').next().unwrap_or(core);
-    // Trailing numeric components are pids, epochs, nonces.
+    // Trailing numeric components are pids, epochs, nonces. Stripping stops
+    // while the head still has a `-` in it: a game id that happens to be all
+    // digits (`leyen-440-<epoch>-<n>`) is the identifying part, not framing.
     while let Some((head, tail)) = core.rsplit_once('-')
+        && head.contains('-')
         && !tail.is_empty()
         && tail.chars().all(|c| c.is_ascii_digit())
     {
@@ -144,12 +155,19 @@ pub(crate) fn unit_matches_app_id(unit: &str, app_id: &str) -> bool {
 /// `app_id`. Covers units whose name says nothing about the app: `run-*.scope`
 /// from `systemd-run --scope`, and `dbus-:1.2-<Name>@0.service` from D-Bus
 /// activation. comm is truncated to 15 bytes, so compare by prefix too.
-pub(crate) fn unit_procs_match_app_id(unit_dir: &std::path::Path, app_id: &str) -> bool {
+pub(crate) fn unit_procs_match_app_id(
+    unit_dir: &std::path::Path,
+    app_id: &str,
+    deadline: Instant,
+) -> bool {
     let Ok(procs) = fs::read_to_string(unit_dir.join("cgroup.procs")) else {
         return false;
     };
     let wanted = name_tokens(app_id);
     procs.lines().take(64).any(|pid| {
+        if Instant::now() >= deadline {
+            return false;
+        }
         let comm = read_trimmed(&format!("/proc/{pid}/comm"))
             .unwrap_or_default()
             .to_ascii_lowercase();
@@ -186,38 +204,47 @@ pub(crate) fn app_slice_units(app_slice: &std::path::Path) -> Vec<std::path::Pat
     units
 }
 
-/// Resolve a Wayland app_id to an app.slice unit cgroup: by unit name first,
-/// then by the game id in the processes' environment, then by their comm.
+/// Resolve a Wayland app_id to an app.slice unit cgroup.
+///
+/// A `steam_app_<id>` window is resolved by the game id in the unit's process
+/// environment first: it shares the token `steam` with the Steam client's own
+/// unit, so the name heuristic would match the client and never the game.
+/// Everything else goes by unit name, then by the processes' comm.
+///
+/// `deadline` bounds the whole scan. It is checked between units because a
+/// single pass reads `cgroup.procs` and up to a few hundred `/proc` entries,
+/// and the caller's timeout cannot interrupt blocking work once it started.
 pub(crate) fn find_app_scope_for_app_id(
     app_slice: &std::path::Path,
     app_id: &str,
+    deadline: Instant,
 ) -> Option<String> {
     let units = app_slice_units(app_slice);
     if units.is_empty() {
         return None;
     }
-    let by_name: Vec<&std::path::PathBuf> = units
-        .iter()
-        .filter(|p| {
-            unit_matches_app_id(&p.file_name().unwrap_or_default().to_string_lossy(), app_id)
-        })
-        .collect();
-    let by_env: Vec<&std::path::PathBuf> = match (by_name.is_empty(), steam_app_id(app_id)) {
-        (true, Some(id)) => units
-            .iter()
-            .filter(|p| unit_env_has_game_id(p, id))
-            .collect(),
-        _ => Vec::new(),
-    };
-    let matches: Vec<&std::path::PathBuf> = if !by_name.is_empty() {
-        by_name
-    } else if !by_env.is_empty() {
-        by_env
-    } else {
+    let scan = |f: &dyn Fn(&std::path::PathBuf) -> bool| -> Vec<&std::path::PathBuf> {
         units
             .iter()
-            .filter(|p| unit_procs_match_app_id(p, app_id))
+            .take_while(|_| Instant::now() < deadline)
+            .filter(|p| f(p))
             .collect()
+    };
+    let by_env = match steam_app_id(app_id) {
+        Some(id) => scan(&|p| unit_env_has_game_id(p, id, deadline)),
+        None => Vec::new(),
+    };
+    let matches = if by_env.is_empty() {
+        let by_name = scan(&|p| {
+            unit_matches_app_id(&p.file_name().unwrap_or_default().to_string_lossy(), app_id)
+        });
+        if by_name.is_empty() {
+            scan(&|p| unit_procs_match_app_id(p, app_id, deadline))
+        } else {
+            by_name
+        }
+    } else {
+        by_env
     };
     if matches.len() > 1 {
         warn!(
@@ -232,6 +259,11 @@ pub(crate) fn find_app_scope_for_app_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A deadline far enough away that the scan is never the thing under test.
+    fn far_future() -> Instant {
+        Instant::now() + std::time::Duration::from_secs(60)
+    }
 
     #[test]
     fn unescape_unit_name_decodes_hex() {
@@ -322,15 +354,19 @@ mod tests {
             ]
         );
         assert_eq!(
-            find_app_scope_for_app_id(&root, "org.gnome.Loupe").map(|p| unit_label(&p).to_string()),
+            find_app_scope_for_app_id(&root, "org.gnome.Loupe", far_future())
+                .map(|p| unit_label(&p).to_string()),
             Some("dbus-:1.2-org.gnome.Loupe@0.service".to_string())
         );
         assert_eq!(
-            find_app_scope_for_app_id(&root, "org.mozilla.firefox")
+            find_app_scope_for_app_id(&root, "org.mozilla.firefox", far_future())
                 .map(|p| unit_label(&p).to_string()),
             Some("app-flatpak-org.mozilla.firefox-1.scope".to_string())
         );
-        assert_eq!(find_app_scope_for_app_id(&root, "Alacritty"), None);
+        assert_eq!(
+            find_app_scope_for_app_id(&root, "Alacritty", far_future()),
+            None
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -343,5 +379,38 @@ mod tests {
         assert_eq!(steam_app_id("steam_app_ly5550"), Some("ly5550"));
         assert_eq!(steam_app_id("steam_app_"), None);
         assert_eq!(steam_app_id("firefox"), None);
+    }
+
+    #[test]
+    fn a_steam_window_collides_with_the_steam_client_by_name() {
+        // Why find_app_scope_for_app_id checks the game id in the process
+        // environment before it looks at names: every steam_app_<id> window
+        // shares the token "steam" with the client's own unit, so name
+        // matching alone resolves a game to the client that started it.
+        assert!(unit_matches_app_id(
+            "app-flatpak-com.valvesoftware.Steam-1234.scope",
+            "steam_app_440"
+        ));
+        assert!(unit_matches_app_id(
+            "app-steam@abc.service",
+            "steam_app_440"
+        ));
+    }
+
+    #[test]
+    fn a_numeric_game_id_survives_the_trailing_number_strip() {
+        assert_eq!(
+            app_unit_core("leyen-440-1788730982-1.scope").as_deref(),
+            Some("leyen-440")
+        );
+        assert!(unit_matches_app_id(
+            "leyen-440-1788730982-1.scope",
+            "steam_app_440"
+        ));
+        // and the launcher's own window must not claim the game's scope
+        assert!(!unit_matches_app_id(
+            "leyen-440-1788730982-1.scope",
+            "leyen"
+        ));
     }
 }

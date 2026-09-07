@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 use zbus::{connection, interface};
@@ -8,11 +9,11 @@ mod matcher;
 mod umbriel;
 
 use cgroup::{
-    cgroup_path_for_pid, cleanup_stale_boosts, current_uid, find_app_scope_for_pid, pid_comm,
-    read_dmem_capacity, unit_label, write_dmem_low,
+    WriteOutcome, cgroup_path_for_pid, cleanup_stale_boosts, current_uid, dmem_low_is,
+    find_app_scope_for_pid, pid_comm, read_dmem_capacity, unit_label, write_dmem_low,
 };
 use matcher::find_app_scope_for_app_id;
-use umbriel::{pick_window, umbriel_socket_path};
+use umbriel::{Action, Tracker, umbriel_socket_path};
 
 fn parse_boost_ratio(raw: &str) -> Option<f64> {
     match raw.parse::<f64>() {
@@ -31,9 +32,31 @@ fn read_boost_ratio() -> f64 {
     }
 }
 
+/// Trim a string that came from a window or another process before it goes
+/// into a log line: control characters would let any app forge journal
+/// entries, and an overlong id would bury the rest of the line.
+fn loggable(raw: &str) -> String {
+    let clean: String = raw.chars().filter(|c| !c.is_control()).collect();
+    match clean.char_indices().nth(64) {
+        Some((i, _)) => format!("{}\u{2026}", &clean[..i]),
+        None => clean,
+    }
+}
+
+/// The part of the cgroup tree this daemon owns: its own user slice, and the
+/// app slice inside it that app_id matching scans.
+struct Scope {
+    user_root: std::path::PathBuf,
+    app_slice: std::path::PathBuf,
+}
+
 struct Inner {
-    prev_cgroup: Option<String>,
+    /// Cgroup that currently holds the boost.
+    boosted_cgroup: Option<String>,
+    /// Unit label of that cgroup, for ctl.
     current_unit: String,
+    /// Umbriel socket the follower is reading, empty while it is waiting.
+    following: String,
     drm_key: String,
     vram_total: u64,
     boost_ratio: f64,
@@ -44,59 +67,75 @@ impl Inner {
         (self.vram_total as f64 * self.boost_ratio) as u64
     }
 
-    async fn reset_previous(&mut self) {
-        if let Some(ref prev) = self.prev_cgroup {
-            match write_dmem_low(prev, &self.drm_key, 0).await {
-                Ok(true) => info!("dmem.low=0 \u{2190} {}", unit_label(prev)),
-                Ok(false) => info!("dmem.low missing (scope gone?): {}", unit_label(prev)),
-                Err(e) => warn!(
-                    "Failed to revert dmem.low to 0 for {}: {e}",
-                    unit_label(prev)
-                ),
+    async fn clear_boost(&mut self) {
+        if let Some(cgroup) = self.boosted_cgroup.take() {
+            let label = unit_label(&cgroup);
+            match write_dmem_low(&cgroup, &self.drm_key, 0).await {
+                Ok(WriteOutcome::Wrote) => info!("cleared the boost on {label}"),
+                Ok(WriteOutcome::Missing) => {
+                    info!("nothing to clear on {label}, its scope is gone");
+                }
+                Ok(WriteOutcome::TimedOut) => {
+                    warn!("clearing the boost on {label} did not finish in 2 s");
+                }
+                Err(e) => warn!("cannot clear the boost on {label}: {e}"),
             }
         }
-        self.prev_cgroup = None;
         self.current_unit.clear();
     }
 
     async fn handle_focus(&mut self, cgroup: Option<String>, source: &str) -> bool {
-        let cgroup = match cgroup {
-            Some(p) => p,
-            None => {
-                info!("{source} skip (no app.slice unit); clearing previous boost");
-                self.reset_previous().await;
-                return false;
+        let Some(cgroup) = cgroup else {
+            if self.boosted_cgroup.is_some() {
+                info!("{source} has no app.slice unit; clearing the boost");
             }
+            self.clear_boost().await;
+            return false;
         };
-
-        // prev_cgroup is only ever set after a successful boost, so a match here
-        // means the previous boost succeeded and remains in effect.
-        if self.prev_cgroup.as_deref() == Some(cgroup.as_str()) {
-            return true;
-        }
 
         let label = unit_label(&cgroup).to_string();
         let boost = self.boost_bytes();
-        info!("focus {source} \u{2192} dmem.low={boost} \u{2192} {label}");
 
-        self.reset_previous().await;
+        // Same cgroup as last time. Trusting that in-memory state would hide a
+        // boost that something else reverted, so the file decides.
+        if self.boosted_cgroup.as_deref() == Some(cgroup.as_str()) {
+            if dmem_low_is(&cgroup, &self.drm_key, boost).await {
+                return true;
+            }
+            info!("the boost on {label} was reverted from outside, applying it again");
+        }
 
-        match write_dmem_low(&cgroup, &self.drm_key, boost).await {
-            Ok(true) => {
-                info!("dmem.low={boost} \u{2192} {label}");
-                self.prev_cgroup = Some(cgroup);
-                self.current_unit = label;
+        self.clear_boost().await;
+        // Remembered before the write, not after: if the daemon is stopped
+        // mid-write, its exit still knows which cgroup to clear.
+        self.boosted_cgroup = Some(cgroup.clone());
+        self.current_unit = label.clone();
+
+        let boosted = match write_dmem_low(&cgroup, &self.drm_key, boost).await {
+            Ok(WriteOutcome::Wrote) => {
+                info!("boosted {label} to dmem.low={boost} ({source})");
                 true
             }
-            Ok(false) => {
-                warn!("Failed to boost {label}: dmem.low missing. Is dmemcg-booster running?");
+            Ok(WriteOutcome::Missing) => {
+                warn!(
+                    "cannot boost {label}: it has no dmem.low. Is the user dmemcg-booster.service running?"
+                );
+                false
+            }
+            Ok(WriteOutcome::TimedOut) => {
+                warn!("cannot boost {label}: the write to dmem.low did not finish in 2 s");
                 false
             }
             Err(e) => {
-                warn!("Failed to write dmem.low boost for {label}: {e}");
+                warn!("cannot boost {label}: {e}");
                 false
             }
+        };
+        if !boosted {
+            self.boosted_cgroup = None;
+            self.current_unit.clear();
         }
+        boosted
     }
 }
 
@@ -105,45 +144,79 @@ impl Inner {
 /// rather than a licence to guess. The app_id is matched against unit names
 /// and process environments only when there is no usable pid (an X11 window
 /// behind xwayland-satellite, or a process that exited meanwhile).
-async fn apply_focus(
-    inner: &Mutex<Inner>,
-    app_slice: &std::path::Path,
-    pid: Option<u32>,
-    app_id: &str,
-) -> bool {
-    let root = app_slice.to_path_buf();
+async fn apply_focus(inner: &Mutex<Inner>, scope: &Scope, pid: Option<u32>, app_id: &str) -> bool {
+    // The lookup reads /proc, so it runs on the blocking pool, where a timeout
+    // cannot cancel it. The deadline inside the closure is what actually stops
+    // it; the outer timeout only covers the handoff.
+    const BUDGET: Duration = Duration::from_millis(800);
+    let deadline = Instant::now() + BUDGET;
+    let app_slice = scope.app_slice.clone();
     let id = app_id.to_string();
     let lookup = tokio::time::timeout(
-        std::time::Duration::from_millis(800),
+        BUDGET + Duration::from_millis(200),
         tokio::task::spawn_blocking(move || {
             let live = pid.filter(|p| cgroup_path_for_pid(*p).is_some());
             let comm = live.map(pid_comm).unwrap_or_default();
             match live {
-                Some(p) => (find_app_scope_for_pid(p, 3), comm),
-                None if !id.is_empty() => (find_app_scope_for_app_id(&root, &id), comm),
+                Some(p) => (find_app_scope_for_pid(p, 3, deadline), comm),
+                None if !id.is_empty() => {
+                    (find_app_scope_for_app_id(&app_slice, &id, deadline), comm)
+                }
                 None => (None, comm),
             }
         }),
     )
     .await
     .ok()
-    .and_then(|r| r.ok());
+    .and_then(Result::ok);
     let (cgroup, comm) = lookup.unwrap_or((None, String::new()));
+
+    // A pid may belong to any user on the system; only this user's own slice
+    // is this daemon's to write.
+    let cgroup = cgroup.filter(|c| {
+        let ours = std::path::Path::new(c).starts_with(&scope.user_root);
+        if !ours {
+            warn!(
+                "ignoring {}: outside {}",
+                loggable(c),
+                scope.user_root.display()
+            );
+        }
+        ours
+    });
+
     let source = match pid {
-        Some(p) => format!("pid={p} ({comm}) app_id={app_id}"),
-        None => format!("app_id={app_id}"),
+        Some(p) => format!("pid={p} ({}) app_id={}", loggable(&comm), loggable(app_id)),
+        None => format!("app_id={}", loggable(app_id)),
     };
     inner.lock().await.handle_focus(cgroup, &source).await
 }
 
 /// Hold `subscribe windows` open on the Umbriel socket and boost whatever is
 /// active. Reconnects whenever the compositor is not there yet or goes away;
-/// the initial snapshot after each (re)connect re-arms the boost.
-async fn follow_umbriel(inner: Arc<Mutex<Inner>>, app_slice: Arc<std::path::PathBuf>) {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let retry = std::time::Duration::from_secs(3);
+/// the initial snapshot after each (re)connect re-arms the boost. Waiting
+/// backs off, so a session without Umbriel does not retry every three seconds
+/// for hours.
+async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    const FIRST_RETRY: Duration = Duration::from_secs(3);
+    const MAX_RETRY: Duration = Duration::from_secs(60);
+    /// A `windows` snapshot is a few kilobytes. Reading further than this
+    /// would grow the buffer without a bound the peer respects.
+    const MAX_LINE: u64 = 1 << 20;
+
+    let mut retry = FIRST_RETRY;
     let mut waiting = false;
+    let mut tracker = Tracker::default();
+
     loop {
+        let backoff = |retry: &mut Duration| {
+            let wait = *retry;
+            *retry = (*retry * 2).min(MAX_RETRY);
+            wait
+        };
+
         let Some(path) = umbriel_socket_path() else {
             if !waiting {
                 warn!(
@@ -151,7 +224,7 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, app_slice: Arc<std::path::Path
                 );
                 waiting = true;
             }
-            tokio::time::sleep(retry).await;
+            tokio::time::sleep(backoff(&mut retry)).await;
             continue;
         };
         let mut stream = match tokio::net::UnixStream::connect(&path).await {
@@ -164,7 +237,7 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, app_slice: Arc<std::path::Path
                     );
                     waiting = true;
                 }
-                tokio::time::sleep(retry).await;
+                tokio::time::sleep(backoff(&mut retry)).await;
                 continue;
             }
         };
@@ -172,57 +245,76 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, app_slice: Arc<std::path::Path
             .write_all(b"{\"cmd\":\"subscribe\",\"events\":[\"windows\"]}\n")
             .await
         {
-            warn!("subscribe failed: {e}");
-            tokio::time::sleep(retry).await;
+            warn!("subscribing to Umbriel failed: {e}");
+            tokio::time::sleep(backoff(&mut retry)).await;
             continue;
         }
         info!("following {}", path.display());
         waiting = false;
-        let (reader, _writer) = stream.into_split();
-        let mut lines = BufReader::new(reader).lines();
-        // Key of the last window that was boosted; a repeated snapshot for the
-        // same window (title, geometry) costs nothing. A failed resolution is
-        // not remembered, so the next event retries.
-        let mut last: Option<String> = None;
-        while let Ok(Some(line)) = lines.next_line().await {
+        retry = FIRST_RETRY;
+        inner.lock().await.following = path.display().to_string();
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = {
+                let mut limited = (&mut reader).take(MAX_LINE);
+                limited.read_line(&mut line).await
+            };
+            match read {
+                Ok(_) if line.is_empty() => break,
+                Ok(_) if !line.ends_with('\n') => {
+                    warn!(
+                        "Umbriel sent more than {MAX_LINE} bytes without a newline; reconnecting"
+                    );
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("reading from Umbriel failed: {e}");
+                    break;
+                }
+            }
             let v: serde_json::Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
             if let Some(err) = v["err"].as_str() {
-                tracing::error!("Umbriel rejected the subscription: {err}");
+                tracing::error!(
+                    "Umbriel rejected the subscription: {}. Retrying every {} s.",
+                    loggable(err),
+                    MAX_RETRY.as_secs()
+                );
+                retry = MAX_RETRY;
                 break;
             }
             if v["event"] != "windows" {
                 continue;
             }
-            match pick_window(&v["data"]) {
-                Some((pid, app_id)) => {
-                    let key = match pid {
-                        Some(p) => format!("pid:{p}"),
-                        None => format!("app:{app_id}"),
-                    };
-                    if last.as_deref() == Some(key.as_str()) {
-                        continue;
-                    }
-                    let boosted = apply_focus(&inner, &app_slice, pid, &app_id).await;
-                    last = boosted.then_some(key);
+            match tracker.next(&v["data"], Instant::now()) {
+                Action::Boost { pid, app_id, key } => {
+                    let boosted = apply_focus(&inner, &scope, pid, &app_id).await;
+                    tracker.record(key, boosted, Instant::now());
                 }
-                None => {
-                    last = None;
-                    inner.lock().await.reset_previous().await;
-                }
+                Action::Clear => inner.lock().await.clear_boost().await,
+                Action::Skip => {}
             }
         }
-        info!("Umbriel stream closed; clearing boost");
-        inner.lock().await.reset_previous().await;
-        tokio::time::sleep(retry).await;
+
+        info!("the Umbriel stream closed; clearing the boost");
+        {
+            let mut guard = inner.lock().await;
+            guard.following.clear();
+            guard.clear_boost().await;
+        }
+        tokio::time::sleep(backoff(&mut retry)).await;
     }
 }
 
 struct VramBoosterService {
     inner: Arc<Mutex<Inner>>,
-    app_slice: Arc<std::path::PathBuf>,
+    scope: Arc<Scope>,
 }
 
 #[interface(name = "org.umbriel.VramBooster")]
@@ -231,17 +323,22 @@ impl VramBoosterService {
     /// itself from the Umbriel socket. pid `-1` means "none".
     async fn focus_window(&self, pid: String, app_id: String) -> bool {
         let pid: Option<u32> = pid.trim().parse().ok().filter(|p| *p > 0);
-        apply_focus(&self.inner, &self.app_slice, pid, app_id.trim()).await
+        apply_focus(&self.inner, &self.scope, pid, app_id.trim()).await
     }
 
     async fn clear_focus(&self) -> bool {
-        self.inner.lock().await.reset_previous().await;
+        self.inner.lock().await.clear_boost().await;
         true
     }
 
     #[zbus(property)]
     async fn current_unit(&self) -> String {
         self.inner.lock().await.current_unit.clone()
+    }
+
+    #[zbus(property)]
+    async fn following(&self) -> String {
+        self.inner.lock().await.following.clone()
     }
 
     #[zbus(property)]
@@ -265,73 +362,99 @@ impl VramBoosterService {
     }
 
     #[zbus(property)]
-    async fn prev_cgroup(&self) -> String {
+    async fn boosted_cgroup(&self) -> String {
         self.inner
             .lock()
             .await
-            .prev_cgroup
+            .boosted_cgroup
             .clone()
             .unwrap_or_default()
     }
 }
 
+fn die(message: &str) -> ! {
+    tracing::error!("{message}");
+    std::process::exit(1);
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
     tracing_subscriber::fmt::init();
 
     let boost_ratio = read_boost_ratio();
-    info!("boost_ratio={boost_ratio}");
-
     let (drm_key, vram_total) = match read_dmem_capacity() {
-        Some(v) => v,
-        None => {
-            tracing::error!(
-                "No dmem capacity in /sys/fs/cgroup/dmem.capacity. Is dmemcg-booster running?"
-            );
-            std::process::exit(1);
-        }
+        Ok(v) => v,
+        Err(e) => die(&e),
     };
     let boost_bytes = (vram_total as f64 * boost_ratio) as u64;
     info!(
-        "GPU: {drm_key}, VRAM: {vram_total} bytes ({} MiB), boost: {boost_bytes} bytes",
-        vram_total / 1024 / 1024
+        "GPU {drm_key}, VRAM {} MiB, boost {boost_bytes} bytes ({:.0}% of it)",
+        vram_total / 1024 / 1024,
+        boost_ratio * 100.0
     );
 
-    let uid = current_uid();
-    let cleanup_root =
-        std::path::PathBuf::from(format!("/sys/fs/cgroup/user.slice/user-{uid}.slice"));
-    let app_slice = Arc::new(cleanup_root.join(format!("user@{uid}.service/app.slice")));
-    let cleared = cleanup_stale_boosts(&cleanup_root, &drm_key, boost_bytes);
-    info!(
-        "startup cleanup: cleared {cleared} stale dmem.low boost value(s) under {cleanup_root:?}"
-    );
+    let Some(uid) = current_uid() else {
+        die("cannot read /proc/self, so this session's uid is unknown");
+    };
+    let user_root = std::path::PathBuf::from(format!("/sys/fs/cgroup/user.slice/user-{uid}.slice"));
+    let scope = Arc::new(Scope {
+        app_slice: user_root.join(format!("user@{uid}.service/app.slice")),
+        user_root,
+    });
 
+    let cleanup_key = drm_key.clone();
     let inner = Arc::new(Mutex::new(Inner {
-        prev_cgroup: None,
+        boosted_cgroup: None,
         current_unit: String::new(),
+        following: String::new(),
         drm_key,
         vram_total,
         boost_ratio,
     }));
 
-    let _conn = connection::Builder::session()?
-        .name("org.umbriel.VramBooster")?
-        .serve_at(
-            "/org/umbriel/VramBooster",
-            VramBoosterService {
-                inner: inner.clone(),
-                app_slice: app_slice.clone(),
-            },
-        )?
-        .build()
-        .await?;
+    // The bus name is claimed before anything is written: a second instance
+    // has to fail here, while the running one still owns the boost it applied.
+    let conn = connection::Builder::session()
+        .and_then(|b| b.name("org.umbriel.VramBooster"))
+        .and_then(|b| {
+            b.serve_at(
+                "/org/umbriel/VramBooster",
+                VramBoosterService {
+                    inner: inner.clone(),
+                    scope: scope.clone(),
+                },
+            )
+        });
+    let _conn = match conn {
+        Ok(builder) => match builder.build().await {
+            Ok(c) => c,
+            Err(e) => die(&format!(
+                "cannot take org.umbriel.VramBooster on the session bus: {e}. Is another instance running?"
+            )),
+        },
+        Err(e) => die(&format!("cannot set up the session bus connection: {e}")),
+    };
 
-    info!("umbriel-vram-booster ready on session bus (org.umbriel.VramBooster)");
-    let follower = tokio::spawn(follow_umbriel(inner.clone(), app_slice.clone()));
+    let cleared = cleanup_stale_boosts(&scope.user_root, &cleanup_key, boost_bytes);
+    if cleared > 0 {
+        info!(
+            "startup cleanup: cleared {cleared} stale boost value(s) under {}",
+            scope.user_root.display()
+        );
+    }
+
+    info!("ready on the session bus as org.umbriel.VramBooster");
+    let follower = tokio::spawn(follow_umbriel(inner.clone(), scope.clone()));
 
     use tokio::signal::unix::{SignalKind, signal};
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => die(&format!("cannot listen for SIGTERM: {e}")),
+    };
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(e) => die(&format!("cannot listen for SIGINT: {e}")),
+    };
 
     tokio::select! {
         _ = sigterm.recv() => info!("received SIGTERM"),
@@ -339,10 +462,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     follower.abort();
-    let mut guard = inner.lock().await;
-    guard.reset_previous().await;
+    inner.lock().await.clear_boost().await;
     info!("cleanup done, exiting");
-    Ok(())
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 //! that map a pid to its systemd unit cgroup.
 
 use std::fs;
+use std::time::Instant;
 use tracing::warn;
 
 pub(crate) fn parse_dmem_capacity(content: &str) -> Vec<(String, u64)> {
@@ -20,21 +21,39 @@ pub(crate) fn parse_dmem_capacity(content: &str) -> Vec<(String, u64)> {
         .collect()
 }
 
-pub(crate) fn read_dmem_capacity() -> Option<(String, u64)> {
-    let content = fs::read_to_string("/sys/fs/cgroup/dmem.capacity").ok()?;
-    let entries: Vec<(String, u64)> = parse_dmem_capacity(&content);
-
-    if let Ok(override_key) = std::env::var("DRM_KEY") {
-        return entries
-            .into_iter()
-            .find(|(k, _)| *k == override_key)
-            .or_else(|| {
-                warn!("DRM_KEY={override_key} not found in dmem.capacity");
-                None
-            });
+/// The GPU to boost: the largest drm entry in `dmem.capacity`, or the one
+/// `DRM_KEY` names. The error is the message to show the user, since every
+/// failure here has a different cause and a different fix.
+pub(crate) fn read_dmem_capacity() -> Result<(String, u64), String> {
+    let content = fs::read_to_string("/sys/fs/cgroup/dmem.capacity").map_err(|e| {
+        format!(
+            "cannot read /sys/fs/cgroup/dmem.capacity: {e}. Does this kernel have the dmem controller (6.12+)?"
+        )
+    })?;
+    let entries = parse_dmem_capacity(&content);
+    if entries.is_empty() {
+        return Err(
+            "no drm entries in /sys/fs/cgroup/dmem.capacity. Is dmemcg-booster.service running?"
+                .to_string(),
+        );
     }
-
-    entries.into_iter().max_by_key(|(_, v)| *v)
+    match std::env::var("DRM_KEY") {
+        Ok(wanted) => entries
+            .iter()
+            .find(|(k, _)| *k == wanted)
+            .cloned()
+            .ok_or_else(|| {
+                let known: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+                format!(
+                    "DRM_KEY={wanted} is not in dmem.capacity, which lists: {}",
+                    known.join(", ")
+                )
+            }),
+        Err(_) => entries
+            .into_iter()
+            .max_by_key(|(_, v)| *v)
+            .ok_or_else(|| "no usable drm entry in dmem.capacity".to_string()),
+    }
 }
 
 pub(crate) fn cgroup_path_for_pid(pid: u32) -> Option<String> {
@@ -47,31 +66,45 @@ pub(crate) fn cgroup_path_for_pid(pid: u32) -> Option<String> {
     None
 }
 
+/// What a `dmem.low` write did, so a caller can tell a scope that has no
+/// `dmem.low` from one whose write did not finish in time.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WriteOutcome {
+    Wrote,
+    Missing,
+    TimedOut,
+}
+
 pub(crate) async fn write_dmem_low(
     cgroup_dir: &str,
     drm_key: &str,
     bytes: u64,
-) -> std::io::Result<bool> {
+) -> std::io::Result<WriteOutcome> {
     if cgroup_dir.contains("..") {
-        return Ok(false);
+        return Ok(WriteOutcome::Missing);
     }
     let file = format!("{cgroup_dir}/dmem.low");
     let drm_key = drm_key.to_string();
-    let cgroup_dir = cgroup_dir.to_string();
     match tokio::time::timeout(std::time::Duration::from_secs(2), async move {
         if tokio::fs::metadata(&file).await.is_err() {
-            return Ok::<bool, std::io::Error>(false);
+            return Ok::<WriteOutcome, std::io::Error>(WriteOutcome::Missing);
         }
         tokio::fs::write(&file, format!("{drm_key} {bytes}\n")).await?;
-        Ok(true)
+        Ok(WriteOutcome::Wrote)
     })
     .await
     {
         Ok(result) => result,
-        Err(_) => {
-            warn!("write_dmem_low timed out for {cgroup_dir}");
-            Ok(false)
-        }
+        Err(_) => Ok(WriteOutcome::TimedOut),
+    }
+}
+
+/// True if the cgroup's `dmem.low` currently holds `value` for `drm_key`.
+/// Used to notice a boost that something else reverted.
+pub(crate) async fn dmem_low_is(cgroup_dir: &str, drm_key: &str, value: u64) -> bool {
+    match tokio::fs::read_to_string(format!("{cgroup_dir}/dmem.low")).await {
+        Ok(content) => dmem_low_has_value(&content, drm_key, value),
+        Err(_) => false,
     }
 }
 
@@ -92,9 +125,10 @@ pub(crate) fn dmem_low_has_value(content: &str, drm_key: &str, value: u64) -> bo
 
 /// uid of the session this daemon runs as (owner of /proc/self). Used to scope
 /// startup cleanup to our own user slice so we never touch other users' scopes.
-pub(crate) fn current_uid() -> u32 {
+/// There is no sensible default: uid 0 would point the daemon at root's slice.
+pub(crate) fn current_uid() -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
-    fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(0)
+    fs::metadata("/proc/self").map(|m| m.uid()).ok()
 }
 
 /// Best-effort startup cleanup: clear dmem.low values left behind by a crashed
@@ -150,8 +184,24 @@ pub(crate) fn pid_comm(pid: u32) -> String {
     read_trimmed(&format!("/proc/{pid}/comm")).unwrap_or_default()
 }
 
-pub(crate) fn find_app_scope_for_pid(pid: u32, max_depth: usize) -> Option<String> {
-    fn check(pid: u32, depth: usize, max_depth: usize) -> Option<String> {
+/// The app.slice cgroup of `pid`, or of one of its descendants up to
+/// `max_depth`. Launchers commonly sit outside `app.slice` and put the app
+/// they started into a scope of its own.
+///
+/// The search is bounded three ways: by depth, by `MAX_CHILDREN` per level,
+/// and by `deadline` - a supervisor with hundreds of children would otherwise
+/// turn one focus event into thousands of `/proc` reads.
+pub(crate) fn find_app_scope_for_pid(
+    pid: u32,
+    max_depth: usize,
+    deadline: Instant,
+) -> Option<String> {
+    const MAX_CHILDREN: usize = 64;
+
+    fn check(pid: u32, depth: usize, max_depth: usize, deadline: Instant) -> Option<String> {
+        if Instant::now() >= deadline {
+            return None;
+        }
         if let Some(cg) = cgroup_path_for_pid(pid)
             && is_app_scope(&cg)
         {
@@ -162,6 +212,7 @@ pub(crate) fn find_app_scope_for_pid(pid: u32, max_depth: usize) -> Option<Strin
         }
         let task_dir = format!("/proc/{pid}/task");
         let task_entries = fs::read_dir(&task_dir).ok()?;
+        let mut visited = 0;
         for entry in task_entries.flatten() {
             let tid: u32 = match entry.file_name().to_string_lossy().parse() {
                 Ok(t) => t,
@@ -176,14 +227,18 @@ pub(crate) fn find_app_scope_for_pid(pid: u32, max_depth: usize) -> Option<Strin
                     Ok(c) => c,
                     Err(_) => continue,
                 };
-                if let Some(cg) = check(child, depth + 1, max_depth) {
+                if let Some(cg) = check(child, depth + 1, max_depth, deadline) {
                     return Some(cg);
+                }
+                visited += 1;
+                if visited >= MAX_CHILDREN {
+                    return None;
                 }
             }
         }
         None
     }
-    check(pid, 0, max_depth)
+    check(pid, 0, max_depth, deadline)
 }
 
 #[cfg(test)]
