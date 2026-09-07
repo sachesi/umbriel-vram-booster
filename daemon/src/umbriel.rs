@@ -64,6 +64,10 @@ pub(crate) enum Action {
         app_id: String,
         key: String,
     },
+    /// Same window, and its boost is due for a check. Resolving the window
+    /// again would mean another walk through `app.slice`; only the cgroup
+    /// already boosted needs looking at, which is one file read.
+    Verify { key: String },
     /// No window is active: drop any boost.
     Clear,
     /// Same window as last time, and it is not due for another look.
@@ -89,11 +93,19 @@ impl Tracker {
             Some(p) => format!("pid:{p}"),
             None => format!("app:{app_id}"),
         };
-        let pending = |slot: &Option<(String, Instant)>| match slot {
-            Some((k, until)) => *k == key && now < *until,
-            None => false,
+        let boosted_due = match &self.boosted {
+            Some((k, until)) if *k == key => Some(now >= *until),
+            _ => None,
         };
-        if pending(&self.boosted) || pending(&self.failed) {
+        match boosted_due {
+            Some(false) => return Action::Skip,
+            Some(true) => {
+                self.boosted = Some((key.clone(), now + RECHECK));
+                return Action::Verify { key };
+            }
+            None => {}
+        }
+        if matches!(&self.failed, Some((k, until)) if *k == key && now < *until) {
             return Action::Skip;
         }
         Action::Boost { pid, app_id, key }
@@ -153,10 +165,12 @@ mod tests {
         t.record(key, true, t0);
 
         assert_eq!(t.next(&snap, t0 + Duration::from_secs(1)), Action::Skip);
-        assert!(matches!(
-            t.next(&snap, t0 + RECHECK + Duration::from_millis(1)),
-            Action::Boost { .. }
-        ));
+
+        // due for a check: no re-resolution, and the next snapshot right after
+        // is quiet again rather than checking on every event from then on
+        let due = t0 + RECHECK + Duration::from_millis(1);
+        assert!(matches!(t.next(&snap, due), Action::Verify { .. }));
+        assert_eq!(t.next(&snap, due + Duration::from_millis(1)), Action::Skip);
     }
 
     #[test]

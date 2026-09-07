@@ -283,4 +283,44 @@ mod tests {
         assert!(!dmem_low_has_value(body, "drm/other/vram", 7715841638));
         assert!(!dmem_low_has_value("", "drm/0000:2d:00.0/vram", 7715841638));
     }
+
+    /// `dmem.low` is an ordinary file as far as this code is concerned, so the
+    /// boost / revert / re-apply cycle can be exercised in a temp directory.
+    #[tokio::test]
+    async fn a_boost_survives_a_revert_from_outside() {
+        let dir = std::env::temp_dir().join(format!("uvb-write-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_string_lossy().into_owned();
+        let key = "drm/0000:2d:00.0/vram";
+
+        // no dmem.low yet: a write must say so rather than claim success
+        assert_eq!(
+            write_dmem_low(&path, key, 7715841638).await.unwrap(),
+            WriteOutcome::Missing
+        );
+        assert!(!dmem_low_is(&path, key, 7715841638).await);
+
+        fs::write(dir.join("dmem.low"), format!("{key} 0\n")).unwrap();
+        assert_eq!(
+            write_dmem_low(&path, key, 7715841638).await.unwrap(),
+            WriteOutcome::Wrote
+        );
+        assert!(dmem_low_is(&path, key, 7715841638).await);
+
+        // something else reverts it: the daemon must be able to notice
+        fs::write(dir.join("dmem.low"), format!("{key} 0\n")).unwrap();
+        assert!(!dmem_low_is(&path, key, 7715841638).await);
+        assert!(!dmem_low_is(&path, "drm/other/vram", 7715841638).await);
+
+        assert_eq!(
+            write_dmem_low(&path, key, 0).await.unwrap(),
+            WriteOutcome::Wrote
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("dmem.low")).unwrap(),
+            format!("{key} 0\n")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

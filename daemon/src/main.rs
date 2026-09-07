@@ -84,6 +84,31 @@ impl Inner {
         self.current_unit.clear();
     }
 
+    /// Re-apply the boost if something else reverted it. One file read while
+    /// it is intact, and no window resolution: the cgroup is already known.
+    /// False means the caller should resolve the window again.
+    async fn verify_boost(&mut self) -> bool {
+        let Some(cgroup) = self.boosted_cgroup.clone() else {
+            return false;
+        };
+        let boost = self.boost_bytes();
+        if dmem_low_is(&cgroup, &self.drm_key, boost).await {
+            return true;
+        }
+        let label = unit_label(&cgroup).to_string();
+        info!("the boost on {label} was reverted from outside, applying it again");
+        if matches!(
+            write_dmem_low(&cgroup, &self.drm_key, boost).await,
+            Ok(WriteOutcome::Wrote)
+        ) {
+            return true;
+        }
+        warn!("cannot re-apply the boost on {label}; resolving the window again");
+        self.boosted_cgroup = None;
+        self.current_unit.clear();
+        false
+    }
+
     async fn handle_focus(&mut self, cgroup: Option<String>, source: &str) -> bool {
         let Some(cgroup) = cgroup else {
             if self.boosted_cgroup.is_some() {
@@ -96,16 +121,18 @@ impl Inner {
         let label = unit_label(&cgroup).to_string();
         let boost = self.boost_bytes();
 
-        // Same cgroup as last time. Trusting that in-memory state would hide a
-        // boost that something else reverted, so the file decides.
+        // Same cgroup as last time. Trusting in-memory state would hide a
+        // boost that something else reverted, so the file decides. Nothing is
+        // cleared on this path: the cgroup keeping the boost is this one.
         if self.boosted_cgroup.as_deref() == Some(cgroup.as_str()) {
             if dmem_low_is(&cgroup, &self.drm_key, boost).await {
                 return true;
             }
             info!("the boost on {label} was reverted from outside, applying it again");
+        } else {
+            self.clear_boost().await;
         }
 
-        self.clear_boost().await;
         // Remembered before the write, not after: if the daemon is stopped
         // mid-write, its exit still knows which cgroup to clear.
         self.boosted_cgroup = Some(cgroup.clone());
@@ -296,6 +323,13 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>) {
                 Action::Boost { pid, app_id, key } => {
                     let boosted = apply_focus(&inner, &scope, pid, &app_id).await;
                     tracker.record(key, boosted, Instant::now());
+                }
+                Action::Verify { key } => {
+                    if !inner.lock().await.verify_boost().await {
+                        // the cgroup is gone: fall back to the retry path so
+                        // the window is resolved again shortly
+                        tracker.record(key, false, Instant::now());
+                    }
                 }
                 Action::Clear => inner.lock().await.clear_boost().await,
                 Action::Skip => {}
