@@ -10,9 +10,9 @@ License:        GPL-3.0-or-later
 URL:            https://github.com/sachesi/umbriel-vram-booster
 Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 # Crate dependencies, so the build needs no network:
-#   tar xf %{name}-%{version}.tar.gz && cd %{name}-%{version}/daemon
+#   tar xf %%{name}-%%{version}.tar.gz && cd %%{name}-%%{version}/daemon
 #   cargo vendor ../vendor
-#   tar czf %{name}-%{version}-vendor.tar.gz -C .. vendor
+#   tar czf %%{name}-%%{version}-vendor.tar.gz -C .. vendor
 Source1:        %{name}-%{version}-vendor.tar.gz
 
 ExclusiveArch:  x86_64 aarch64
