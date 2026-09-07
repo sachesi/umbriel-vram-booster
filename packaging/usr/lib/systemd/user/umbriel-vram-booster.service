@@ -8,7 +8,7 @@ Type=dbus
 BusName=org.umbriel.VramBooster
 ExecStart=/usr/bin/umbriel-vram-booster
 Environment=RUST_LOG=warn
-# VRAM_BOOST_RATIO=0.90  # uncomment to override (0.0-1.0)
+# Environment=VRAM_BOOST_RATIO=0.90  # uncomment to override (0.0-1.0)
 
 Restart=on-failure
 RestartSec=3
@@ -20,16 +20,21 @@ RestartSec=3
 # /sys/fs/cgroup/**/dmem.low, and connecting to the Umbriel IPC socket under
 # $XDG_RUNTIME_DIR (AF_UNIX).
 #
-# Deliberately NOT set, would break required access:
+# Deliberately NOT set:
 #   ProtectControlGroups=true  -> /sys/fs/cgroup read-only, kills dmem.low writes
 #   ProtectKernelTunables=true -> /sys read-only, breaks dmem.low writes
+#   ProtectProc=invisible      -> system services only, ignored in a user manager
+# ReadWritePaths stays the whole cgroup tree: the daemon itself refuses any
+# cgroup outside this user's own user-<uid>.slice.
 NoNewPrivileges=true
 ProtectSystem=strict
+ProtectHome=true
 ReadWritePaths=/sys/fs/cgroup
 ProtectKernelModules=true
 ProtectKernelLogs=true
 ProtectClock=true
 ProtectHostname=true
+RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_UNIX

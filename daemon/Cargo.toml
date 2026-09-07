@@ -1,7 +1,9 @@
 [package]
 name = "umbriel-vram-booster"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+# let-chains, stable since 1.88
+rust-version = "1.88"
 authors = ["sachesi <xsachesi@pm.me>"]
 description = "Umbriel daemon for dynamic VRAM prioritization via dmem cgroups"
 license = "GPL-3.0-or-later"
@@ -16,8 +18,13 @@ path = "src/ctl.rs"
 
 [dependencies]
 zbus = { version = "4", default-features = false, features = ["tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net", "io-util", "fs"] }
 serde_json = "1"
 zvariant = "4"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
