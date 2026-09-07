@@ -235,7 +235,6 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>) {
 
     let mut retry = FIRST_RETRY;
     let mut waiting = false;
-    let mut tracker = Tracker::default();
 
     loop {
         let backoff = |retry: &mut Duration| {
@@ -280,6 +279,10 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>) {
         waiting = false;
         retry = FIRST_RETRY;
         inner.lock().await.following = path.display().to_string();
+        // Fresh per connection: the boost was cleared when the last one went
+        // away, so the first snapshot has to arm it again rather than be
+        // recognised as the window that was already boosted.
+        let mut tracker = Tracker::default();
 
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
