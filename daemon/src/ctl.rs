@@ -92,7 +92,7 @@ async fn main() {
         props.get("CurrentUnit").map_or("(none)".into(), format_val)
     );
     println!(
-        "Previous cgroup:  {}",
+        "Boosted cgroup:   {}",
         props.get("PrevCgroup").map_or("(none)".into(), format_val)
     );
 }

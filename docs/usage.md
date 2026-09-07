@@ -35,7 +35,7 @@ VRAM total:       8573157376 (8176 MiB, 7.98 GiB)
 Boost ratio:      90%
 Boosted bytes:    7715841638 (7360 MiB, 7.19 GiB) (90% of total)
 Current unit:     app-flatpak-org.mozilla.firefox-1126565164.scope
-Previous cgroup:  (none)
+Boosted cgroup:   (none)
 ```
 
 Running `umbriel-vram-boosterctl` from a terminal shows the terminal's own state, because the terminal is the active window. Focus the app you care about first, e.g. `sleep 5; umbriel-vram-boosterctl` and click over within 5 s.
