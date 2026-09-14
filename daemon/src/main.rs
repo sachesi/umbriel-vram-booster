@@ -45,10 +45,11 @@ fn read_boost_ratio() -> Result<f64, String> {
 
 /// Trim a string that came from a window or another process before it goes
 /// into a log line: control characters would let any app forge journal
-/// entries, and an overlong id would bury the rest of the line.
+/// entries, and an overlong id would bury the rest of the line. The cap is
+/// 255, the longest a unit or cgroup name can be, so those are never cut.
 fn loggable(raw: &str) -> String {
     let clean: String = raw.chars().filter(|c| !c.is_control()).collect();
-    match clean.char_indices().nth(64) {
+    match clean.char_indices().nth(255) {
         Some((i, _)) => format!("{}\u{2026}", &clean[..i]),
         None => clean,
     }
@@ -653,6 +654,18 @@ mod tests {
             .unwrap();
         assert_eq!(seen, format!("{key} 90\n{key} 0\n"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loggable_strips_control_characters_and_caps_the_length() {
+        assert_eq!(loggable("a\nb\x1b[31mc"), "ab[31mc");
+        let unit = format!("app-{}.scope", "x".repeat(245));
+        assert_eq!(unit.len(), 255);
+        assert_eq!(loggable(&unit), unit);
+        assert_eq!(
+            loggable(&"y".repeat(300)),
+            format!("{}\u{2026}", "y".repeat(255))
+        );
     }
 
     #[test]
