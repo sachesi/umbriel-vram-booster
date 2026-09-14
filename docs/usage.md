@@ -76,7 +76,7 @@ umbriel windows --json | jq '.[] | select(.active) | {app_id, pid, xwayland}'
 Drive the resolution by hand (`-1` means no pid):
 
 ```
-busctl --user call org.umbriel.VramBooster /org/umbriel/VramBooster org.umbriel.VramBooster FocusWindow ss -1 firefox
+busctl --user call org.umbriel.VramBooster /org/umbriel/VramBooster org.umbriel.VramBooster FocusWindow ss -- -1 firefox
 busctl --user call org.umbriel.VramBooster /org/umbriel/VramBooster org.umbriel.VramBooster FocusWindow ss $(pgrep -n firefox) firefox
 busctl --user call org.umbriel.VramBooster /org/umbriel/VramBooster org.umbriel.VramBooster ClearFocus
 ```
