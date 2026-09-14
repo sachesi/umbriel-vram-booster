@@ -12,8 +12,8 @@ mod matcher;
 mod umbriel;
 
 use cgroup::{
-    WriteOutcome, cgroup_path_for_pid, cleanup_stale_boosts, current_uid, dmem_low_is,
-    find_app_scope_for_pid, pid_comm, read_dmem_capacity, unit_label, write_dmem_low,
+    DmemWriter, WriteOutcome, cgroup_path_for_pid, cleanup_stale_boosts, current_uid, dmem_low_is,
+    find_app_scope_for_pid, pid_comm, read_dmem_capacity, unit_label,
 };
 use matcher::find_app_scope_for_app_id;
 use umbriel::{Action, Tracker, read_snapshots, umbriel_socket_path};
@@ -65,6 +65,7 @@ struct Inner {
     drm_key: String,
     vram_total: u64,
     boost_ratio: f64,
+    writer: DmemWriter,
     /// Where PropertiesChanged goes, once the bus connection is up.
     signal: Option<SignalContext<'static>>,
     /// CurrentUnit, BoostedCgroup and Following as clients last heard them.
@@ -111,7 +112,7 @@ impl Inner {
     async fn clear_boost(&mut self) {
         if let Some(cgroup) = self.boosted_cgroup.take() {
             let label = loggable(unit_label(&cgroup));
-            match write_dmem_low(&cgroup, &self.drm_key, 0).await {
+            match self.writer.write(&cgroup, &self.drm_key, 0).await {
                 Ok(WriteOutcome::Wrote) => info!("cleared the boost on {label}"),
                 Ok(WriteOutcome::Missing) => {
                     info!("nothing to clear on {label}, its scope is gone");
@@ -138,7 +139,7 @@ impl Inner {
         }
         let label = loggable(unit_label(&cgroup));
         info!("the boost on {label} was reverted from outside, applying it again");
-        match write_dmem_low(&cgroup, &self.drm_key, boost).await {
+        match self.writer.write(&cgroup, &self.drm_key, boost).await {
             Ok(WriteOutcome::Wrote) => return true,
             // The write can still land: keep the cgroup, as handle_focus does.
             Ok(WriteOutcome::TimedOut) => {
@@ -184,7 +185,7 @@ impl Inner {
         self.boosted_cgroup = Some(cgroup.clone());
         self.current_unit = unit_label(&cgroup).to_string();
 
-        let boosted = match write_dmem_low(&cgroup, &self.drm_key, boost).await {
+        let boosted = match self.writer.write(&cgroup, &self.drm_key, boost).await {
             Ok(WriteOutcome::Wrote) => {
                 info!("boosted {label} to dmem.low={boost} ({source})");
                 true
@@ -505,6 +506,7 @@ async fn main() {
         drm_key,
         vram_total,
         boost_ratio,
+        writer: DmemWriter::new(Duration::from_secs(2)),
         signal: None,
         announced: Default::default(),
     }));

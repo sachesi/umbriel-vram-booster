@@ -2,7 +2,7 @@
 //! that map a pid to its systemd unit cgroup.
 
 use std::fs;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 pub(crate) fn parse_dmem_capacity(content: &str) -> Vec<(String, u64)> {
@@ -75,27 +75,60 @@ pub(crate) enum WriteOutcome {
     TimedOut,
 }
 
-pub(crate) async fn write_dmem_low(
-    cgroup_dir: &str,
-    drm_key: &str,
-    bytes: u64,
-) -> std::io::Result<WriteOutcome> {
-    if cgroup_dir.contains("..") {
-        return Ok(WriteOutcome::Missing);
+/// One `dmem.low` write, carried out on the writer thread.
+struct Job {
+    file: String,
+    body: String,
+    done: tokio::sync::oneshot::Sender<std::io::Result<WriteOutcome>>,
+}
+
+/// Writes `dmem.low` files on a thread of its own, one at a time and in the
+/// order they were asked for. A write that hangs holds up the ones behind it
+/// instead of being overtaken, so a clear queued after a boost can never
+/// land first and leave the boost in place. Waiting for a write is bounded;
+/// the write itself is not, since a blocking write cannot be cancelled.
+pub(crate) struct DmemWriter {
+    jobs: std::sync::mpsc::Sender<Job>,
+    timeout: Duration,
+}
+
+impl DmemWriter {
+    pub(crate) fn new(timeout: Duration) -> Self {
+        let (jobs, queue) = std::sync::mpsc::channel::<Job>();
+        std::thread::spawn(move || {
+            for job in queue {
+                let outcome = if fs::metadata(&job.file).is_err() {
+                    Ok(WriteOutcome::Missing)
+                } else {
+                    fs::write(&job.file, job.body).map(|()| WriteOutcome::Wrote)
+                };
+                let _ = job.done.send(outcome);
+            }
+        });
+        Self { jobs, timeout }
     }
-    let file = format!("{cgroup_dir}/dmem.low");
-    let drm_key = drm_key.to_string();
-    match tokio::time::timeout(std::time::Duration::from_secs(2), async move {
-        if tokio::fs::metadata(&file).await.is_err() {
-            return Ok::<WriteOutcome, std::io::Error>(WriteOutcome::Missing);
+
+    pub(crate) async fn write(
+        &self,
+        cgroup_dir: &str,
+        drm_key: &str,
+        bytes: u64,
+    ) -> std::io::Result<WriteOutcome> {
+        if cgroup_dir.contains("..") {
+            return Ok(WriteOutcome::Missing);
         }
-        tokio::fs::write(&file, format!("{drm_key} {bytes}\n")).await?;
-        Ok(WriteOutcome::Wrote)
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Ok(WriteOutcome::TimedOut),
+        let gone = || std::io::Error::other("the dmem.low writer thread is gone");
+        let (done, outcome) = tokio::sync::oneshot::channel();
+        let job = Job {
+            file: format!("{cgroup_dir}/dmem.low"),
+            body: format!("{drm_key} {bytes}\n"),
+            done,
+        };
+        self.jobs.send(job).map_err(|_| gone())?;
+        match tokio::time::timeout(self.timeout, outcome).await {
+            Ok(result) => result.map_err(|_| gone())?,
+            Err(_) => Ok(WriteOutcome::TimedOut),
+        }
     }
 }
 
@@ -323,6 +356,52 @@ mod tests {
         assert!(!dmem_low_has_value("", "drm/0000:2d:00.0/vram", 7715841638));
     }
 
+    /// A FIFO as `dmem.low` blocks a write until someone reads it, which is a
+    /// hung write on demand: the one behind it must wait, not overtake it.
+    #[tokio::test]
+    async fn a_hung_write_is_not_overtaken_by_the_next() {
+        let dir = std::env::temp_dir().join(format!("uvb-fifo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("dmem.low");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let path = dir.to_string_lossy().into_owned();
+        let key = "drm/0000:2d:00.0/vram";
+        let writer = DmemWriter::new(Duration::from_millis(100));
+
+        // nobody reads the FIFO: the boost hangs, and waiting for it gives up
+        assert_eq!(
+            writer.write(&path, key, 7715841638).await.unwrap(),
+            WriteOutcome::TimedOut
+        );
+        // the clear is queued behind it before anything reads the FIFO
+        let clear = writer.write(&path, key, 0);
+        let read = async move {
+            // A plain thread, so a read that never ends fails the test on the
+            // timeout below instead of hanging it. Each write opens and closes
+            // the FIFO; one read may see one write or both.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                let mut seen = String::new();
+                while seen.lines().count() < 2 {
+                    seen += &fs::read_to_string(&fifo).unwrap();
+                }
+                let _ = tx.send(seen);
+            });
+            tokio::time::timeout(Duration::from_secs(5), rx).await
+        };
+        let (_, seen) = tokio::join!(clear, read);
+        let seen = seen.expect("the FIFO never saw both writes").unwrap();
+        assert_eq!(seen, format!("{key} 7715841638\n{key} 0\n"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// `dmem.low` is an ordinary file as far as this code is concerned, so the
     /// boost / revert / re-apply cycle can be exercised in a temp directory.
     #[tokio::test]
@@ -332,17 +411,18 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.to_string_lossy().into_owned();
         let key = "drm/0000:2d:00.0/vram";
+        let writer = DmemWriter::new(Duration::from_secs(2));
 
         // no dmem.low yet: a write must say so rather than claim success
         assert_eq!(
-            write_dmem_low(&path, key, 7715841638).await.unwrap(),
+            writer.write(&path, key, 7715841638).await.unwrap(),
             WriteOutcome::Missing
         );
         assert!(!dmem_low_is(&path, key, 7715841638).await);
 
         fs::write(dir.join("dmem.low"), format!("{key} 0\n")).unwrap();
         assert_eq!(
-            write_dmem_low(&path, key, 7715841638).await.unwrap(),
+            writer.write(&path, key, 7715841638).await.unwrap(),
             WriteOutcome::Wrote
         );
         assert!(dmem_low_is(&path, key, 7715841638).await);
@@ -353,7 +433,7 @@ mod tests {
         assert!(!dmem_low_is(&path, "drm/other/vram", 7715841638).await);
 
         assert_eq!(
-            write_dmem_low(&path, key, 0).await.unwrap(),
+            writer.write(&path, key, 0).await.unwrap(),
             WriteOutcome::Wrote
         );
         assert_eq!(
