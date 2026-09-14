@@ -35,7 +35,7 @@ See [docs/install.md](docs/install.md) for full instructions and [docs/usage.md]
 
 ## How it works
 
-1. The daemon connects to Umbriel's socket (`UMBRIEL_SOCKET`, or `$XDG_RUNTIME_DIR/umbriel-$WAYLAND_DISPLAY.sock`, or the newest `umbriel-*.sock` there) and sends `{"cmd":"subscribe","events":["windows"]}`. Umbriel answers with the current window list and then a fresh list on every change.
+1. The daemon connects to Umbriel's socket (`UMBRIEL_SOCKET`, or `$XDG_RUNTIME_DIR/umbriel-$WAYLAND_DISPLAY.sock` if it exists, or the newest `umbriel-*.sock` there) and sends `{"cmd":"subscribe","events":["windows"]}`. Umbriel answers with the current window list and then a fresh list on every change.
 2. From each list it takes the `active` entry (seat-global keyboard focus; `focused` is per workspace).
 3. A native Wayland window carries its client `pid`: the daemon resolves it to its systemd cgroup through `/proc`. An X11 window reports `-1` (its client is the xwayland-satellite bridge), so its `app_id` is matched against units under `app.slice` instead.
 4. The daemon writes `dmem.low = VRAM_total * boost_ratio` to that unit's cgroup.

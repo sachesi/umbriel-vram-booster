@@ -12,10 +12,24 @@ pub(crate) fn umbriel_socket_path() -> Option<std::path::PathBuf> {
         return Some(p.into());
     }
     let run = std::env::var("XDG_RUNTIME_DIR").ok()?;
-    if let Ok(display) = std::env::var("WAYLAND_DISPLAY") {
-        return Some(format!("{run}/umbriel-{display}.sock").into());
+    let display = std::env::var("WAYLAND_DISPLAY").ok();
+    socket_in_runtime_dir(std::path::Path::new(&run), display.as_deref())
+}
+
+/// The derived socket counts only if it exists: the user manager can hold a
+/// `WAYLAND_DISPLAY` from another compositor or an earlier session, and an
+/// absolute one names no `umbriel-*.sock` at all. Either way the scan decides.
+fn socket_in_runtime_dir(
+    run: &std::path::Path,
+    display: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    if let Some(display) = display.filter(|d| !d.is_empty() && !d.contains('/')) {
+        let derived = run.join(format!("umbriel-{display}.sock"));
+        if derived.exists() {
+            return Some(derived);
+        }
     }
-    fs::read_dir(&run)
+    fs::read_dir(run)
         .ok()?
         .flatten()
         .filter(|e| {
@@ -45,9 +59,9 @@ pub(crate) fn pick_window(windows: &serde_json::Value) -> Option<(Option<u32>, S
 }
 
 /// How long a window stays deduplicated after a successful boost. Repeated
-/// snapshots for the same window cost nothing, but the boost is re-resolved
-/// this often so one reverted from outside (a `dmemcg-booster` restart, a
-/// stray write) is noticed while focus stays put.
+/// snapshots for the same window cost nothing, but the boosted cgroup's
+/// `dmem.low` is read again this often so a boost reverted from outside (a
+/// `dmemcg-booster` restart, a stray write) is noticed while focus stays put.
 const RECHECK: Duration = Duration::from_secs(5);
 
 /// How long a window that resolved to no unit waits before another attempt.
@@ -146,6 +160,35 @@ mod tests {
         assert_eq!(pick_window(&serde_json::Value::Null), None);
         let pid_only = serde_json::json!([{"active": true, "pid": 7}]);
         assert_eq!(pick_window(&pid_only), Some((Some(7), String::new())));
+    }
+
+    #[test]
+    fn socket_falls_back_to_the_scan_when_the_derived_one_is_missing() {
+        let run = std::env::temp_dir().join(format!("uvb-sock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&run);
+        fs::create_dir_all(&run).unwrap();
+        assert_eq!(socket_in_runtime_dir(&run, Some("wayland-1")), None);
+
+        let live = run.join("umbriel-wayland-2.sock");
+        fs::write(&live, "").unwrap();
+        // a stale or foreign WAYLAND_DISPLAY must not hide the live socket
+        assert_eq!(
+            socket_in_runtime_dir(&run, Some("wayland-0")),
+            Some(live.clone())
+        );
+        assert_eq!(
+            socket_in_runtime_dir(&run, Some("/tmp/wl.sock")),
+            Some(live.clone())
+        );
+        assert_eq!(socket_in_runtime_dir(&run, None), Some(live.clone()));
+
+        let derived = run.join("umbriel-wayland-1.sock");
+        fs::write(&derived, "").unwrap();
+        assert_eq!(
+            socket_in_runtime_dir(&run, Some("wayland-1")),
+            Some(derived)
+        );
+        let _ = fs::remove_dir_all(&run);
     }
 
     fn snapshot(app_id: &str, pid: i64) -> serde_json::Value {

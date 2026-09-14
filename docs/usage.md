@@ -133,7 +133,7 @@ Run `umbriel-vram-boosterctl` first: if `Following` shows a socket, the daemon i
 journalctl --user -u umbriel-vram-booster -b --no-pager | tail
 ```
 
-`no Umbriel socket` means neither `UMBRIEL_SOCKET` nor `WAYLAND_DISPLAY` reached the user manager and no `umbriel-*.sock` exists in `$XDG_RUNTIME_DIR`. `cannot connect` means the socket path exists but Umbriel is not listening. Both retry, starting at 3 s and backing off to 60 s, so a session that starts Umbriel late may take up to a minute to be picked up. To pin the socket:
+`no Umbriel socket` means `UMBRIEL_SOCKET` did not reach the user manager and no `umbriel-*.sock` exists in `$XDG_RUNTIME_DIR` (a `WAYLAND_DISPLAY` whose derived socket is missing falls back to that scan). `cannot connect` means the socket path exists but Umbriel is not listening. Both retry, starting at 3 s and backing off to 60 s, so a session that starts Umbriel late may take up to a minute to be picked up. To pin the socket:
 
 ```
 systemctl --user edit umbriel-vram-booster.service

@@ -248,7 +248,8 @@ pub(crate) fn find_app_scope_for_app_id(
     };
     if matches.len() > 1 {
         warn!(
-            "app_id={app_id}: {} matching units, using {}",
+            "app_id={}: {} matching units, using {}",
+            crate::loggable(app_id),
             matches.len(),
             unit_label(&matches[0].to_string_lossy())
         );

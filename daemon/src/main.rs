@@ -246,7 +246,7 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>) {
         let Some(path) = umbriel_socket_path() else {
             if !waiting {
                 warn!(
-                    "no Umbriel socket (UMBRIEL_SOCKET / WAYLAND_DISPLAY unset, no umbriel-*.sock); waiting"
+                    "no Umbriel socket (UMBRIEL_SOCKET unset, no umbriel-*.sock in XDG_RUNTIME_DIR); waiting"
                 );
                 waiting = true;
             }
