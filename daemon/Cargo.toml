@@ -7,6 +7,8 @@ rust-version = "1.88"
 authors = ["sachesi <xsachesi@pm.me>"]
 description = "Umbriel daemon for dynamic VRAM prioritization via dmem cgroups"
 license = "GPL-3.0-or-later"
+repository = "https://github.com/sachesi/umbriel-vram-booster"
+readme = "../README.md"
 
 [[bin]]
 name = "umbriel-vram-booster"
