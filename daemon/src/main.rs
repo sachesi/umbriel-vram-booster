@@ -62,6 +62,29 @@ struct Scope {
     app_slice: std::path::PathBuf,
 }
 
+/// Properties that changed, with their new values.
+type Changes = Vec<(&'static str, String)>;
+
+/// Send what `Inner::announce` queues, in order, outside the state lock.
+async fn emit_changes(
+    ctxt: SignalContext<'static>,
+    mut queue: tokio::sync::mpsc::UnboundedReceiver<Changes>,
+) {
+    let iface = zbus::names::InterfaceName::from_static_str_unchecked("org.umbriel.VramBooster");
+    while let Some(changed) = queue.recv().await {
+        let values: Vec<(&str, Value)> = changed
+            .iter()
+            .map(|(name, value)| (*name, Value::from(value.as_str())))
+            .collect();
+        let changed: HashMap<&str, &Value> = values.iter().map(|(n, v)| (*n, v)).collect();
+        if let Err(e) =
+            zbus::fdo::Properties::properties_changed(&ctxt, iface.clone(), &changed, &[]).await
+        {
+            warn!("cannot emit PropertiesChanged: {e}");
+        }
+    }
+}
+
 struct Inner {
     /// Cgroup that currently holds the boost.
     boosted_cgroup: Option<String>,
@@ -76,17 +99,19 @@ struct Inner {
     vram_total: u64,
     boost_ratio: f64,
     writer: DmemWriter,
-    /// Where PropertiesChanged goes, once the bus connection is up.
-    signal: Option<SignalContext<'static>>,
+    /// Where PropertiesChanged is queued, once the bus connection is up.
+    changes: Option<tokio::sync::mpsc::UnboundedSender<Changes>>,
     /// CurrentUnit, BoostedCgroup and Following as clients last heard them.
     announced: [String; 3],
 }
 
 impl Inner {
-    /// Emit PropertiesChanged for whatever changed since the last call. Called
-    /// once a change is complete, so a switch from one unit to another is one
-    /// signal rather than a clear and a boost.
-    async fn announce(&mut self) {
+    /// Queue PropertiesChanged for whatever changed since the last call.
+    /// Called once a change is complete, so a switch from one unit to another
+    /// is one signal rather than a clear and a boost. Queued rather than sent,
+    /// since the caller holds the lock on this state and a slow bus must not
+    /// hold it longer; the queue keeps the order.
+    fn announce(&mut self) {
         let now = [
             self.current_unit.clone(),
             self.boosted_cgroup.clone().unwrap_or_default(),
@@ -95,22 +120,14 @@ impl Inner {
         if now == self.announced {
             return;
         }
-        if let Some(ctxt) = &self.signal {
-            let names = ["CurrentUnit", "BoostedCgroup", "Following"];
-            let values = now.clone().map(Value::from);
-            let mut changed: HashMap<&str, &Value> = HashMap::new();
-            for (i, name) in names.into_iter().enumerate() {
-                if now[i] != self.announced[i] {
-                    changed.insert(name, &values[i]);
-                }
-            }
-            let iface =
-                zbus::names::InterfaceName::from_static_str_unchecked("org.umbriel.VramBooster");
-            if let Err(e) =
-                zbus::fdo::Properties::properties_changed(ctxt, iface, &changed, &[]).await
-            {
-                warn!("cannot emit PropertiesChanged: {e}");
-            }
+        let changed = ["CurrentUnit", "BoostedCgroup", "Following"]
+            .into_iter()
+            .zip(now.iter().zip(&self.announced))
+            .filter(|(_, (value, before))| value != before)
+            .map(|(name, (value, _))| (name, value.clone()))
+            .collect();
+        if let Some(changes) = &self.changes {
+            let _ = changes.send(changed);
         }
         self.announced = now;
     }
@@ -284,7 +301,7 @@ async fn apply_focus(inner: &Mutex<Inner>, scope: &Scope, pid: Option<u32>, app_
     };
     let mut guard = inner.lock().await;
     let boosted = guard.handle_focus(cgroup, &source).await;
-    guard.announce().await;
+    guard.announce();
     boosted
 }
 
@@ -347,7 +364,7 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>, overridden:
         {
             let mut guard = inner.lock().await;
             guard.following = path.display().to_string();
-            guard.announce().await;
+            guard.announce();
         }
         // Reading and acting run side by side: a lookup can take most of a
         // second, and a subscriber that stops reading for that long can be
@@ -375,7 +392,7 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>, overridden:
                         let intact = {
                             let mut guard = inner.lock().await;
                             let intact = guard.verify_boost().await;
-                            guard.announce().await;
+                            guard.announce();
                             intact
                         };
                         if !intact {
@@ -387,7 +404,7 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>, overridden:
                     Action::Clear => {
                         let mut guard = inner.lock().await;
                         guard.clear_boost().await;
-                        guard.announce().await;
+                        guard.announce();
                     }
                     Action::Skip => {}
                 }
@@ -408,7 +425,7 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>, overridden:
             let mut guard = inner.lock().await;
             guard.following.clear();
             guard.clear_boost().await;
-            guard.announce().await;
+            guard.announce();
         }
         tokio::time::sleep(backoff(&mut retry)).await;
     }
@@ -436,7 +453,7 @@ impl VramBoosterService {
         {
             let mut guard = self.inner.lock().await;
             guard.clear_boost().await;
-            guard.announce().await;
+            guard.announce();
         }
         self.overridden.store(true, Ordering::Relaxed);
         true
@@ -533,7 +550,7 @@ async fn main() {
         vram_total,
         boost_ratio,
         writer: DmemWriter::new(Duration::from_secs(2)),
-        signal: None,
+        changes: None,
         announced: Default::default(),
     }));
 
@@ -563,7 +580,14 @@ async fn main() {
         },
         Err(e) => die(&format!("cannot set up the session bus connection: {e}")),
     };
-    inner.lock().await.signal = SignalContext::new(&bus, "/org/umbriel/VramBooster").ok();
+    match SignalContext::new(&bus, "/org/umbriel/VramBooster") {
+        Ok(ctxt) => {
+            let (changes, queue) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(emit_changes(ctxt, queue));
+            inner.lock().await.changes = Some(changes);
+        }
+        Err(e) => warn!("PropertiesChanged will not be emitted: {e}"),
+    }
 
     let cleared = cleanup_stale_boosts(&scope.user_root, &cleanup_key, boost_bytes);
     if cleared > 0 {
@@ -628,7 +652,7 @@ mod tests {
             vram_total: 100,
             boost_ratio: 0.9,
             writer: DmemWriter::new(Duration::from_millis(100)),
-            signal: None,
+            changes: None,
             announced: Default::default(),
         };
         let cgroup = dir.to_string_lossy().into_owned();
@@ -654,6 +678,43 @@ mod tests {
             .unwrap();
         assert_eq!(seen, format!("{key} 90\n{key} 0\n"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn announce_queues_only_what_changed_and_only_once() {
+        let (changes, mut queue) = tokio::sync::mpsc::unbounded_channel();
+        let mut inner = Inner {
+            boosted_cgroup: None,
+            unconfirmed: None,
+            current_unit: String::new(),
+            following: "/run/user/1000/umbriel-wayland-1.sock".to_string(),
+            drm_key: String::new(),
+            vram_total: 0,
+            boost_ratio: 0.9,
+            writer: DmemWriter::new(Duration::from_secs(2)),
+            changes: Some(changes),
+            announced: Default::default(),
+        };
+        inner.announce();
+        inner.announce();
+        inner.boosted_cgroup = Some("/a/app.slice/app-foo.scope".to_string());
+        inner.current_unit = "app-foo.scope".to_string();
+        inner.announce();
+        assert_eq!(
+            queue.try_recv().unwrap(),
+            vec![(
+                "Following",
+                "/run/user/1000/umbriel-wayland-1.sock".to_string()
+            )]
+        );
+        assert_eq!(
+            queue.try_recv().unwrap(),
+            vec![
+                ("CurrentUnit", "app-foo.scope".to_string()),
+                ("BoostedCgroup", "/a/app.slice/app-foo.scope".to_string()),
+            ]
+        );
+        assert!(queue.try_recv().is_err());
     }
 
     #[test]
