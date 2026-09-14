@@ -60,6 +60,12 @@ Query daemon status, including which Umbriel socket it follows:
 umbriel-vram-boosterctl
 ```
 
+## Documentation
+
+- [Installing](docs/install.md)
+- [Usage and troubleshooting](docs/usage.md)
+- [Contributing](CONTRIBUTING.md), including where things are in the code, and [reporting a vulnerability](SECURITY.md)
+
 ## License
 
 GPL-3.0-or-later
