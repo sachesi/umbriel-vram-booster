@@ -149,7 +149,7 @@ systemctl --user edit umbriel-vram-booster.service
 
 **Daemon fails to start**
 
-Common cause: `dmemcg-booster` is not running, or `dmem` is not in `cgroup.controllers`.
+Common cause: `dmemcg-booster` is not running, or `dmem` is not in `cgroup.controllers`. The journal names the reason; a `VRAM_BOOST_RATIO` that is not a number above 0 and at most 1 stops it too.
 
 **"Failed to boost ... dmem.low missing"**
 

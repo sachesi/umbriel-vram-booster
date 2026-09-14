@@ -12,6 +12,9 @@ Environment=RUST_LOG=warn
 
 Restart=on-failure
 RestartSec=3
+# 78 (EX_CONFIG) is a setting that is wrong, such as VRAM_BOOST_RATIO;
+# restarting with it cannot help.
+RestartPreventExitStatus=78
 
 # Hardening. Runs as the session user (not root); dmem.low files under this
 # user's user@<uid>.service subtree are user-owned, so no capabilities are

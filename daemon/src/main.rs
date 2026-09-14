@@ -27,13 +27,19 @@ fn parse_boost_ratio(raw: &str) -> Option<f64> {
     }
 }
 
-fn read_boost_ratio() -> f64 {
+/// An invalid ratio is an error rather than a fallback: the unit then fails
+/// with the reason in its log, where a quiet 0.90 would hide the typo.
+fn read_boost_ratio() -> Result<f64, String> {
+    let invalid = |v: &str| {
+        format!(
+            "VRAM_BOOST_RATIO={} is not a number above 0 and at most 1",
+            loggable(v)
+        )
+    };
     match std::env::var("VRAM_BOOST_RATIO") {
-        Ok(v) => parse_boost_ratio(&v).unwrap_or_else(|| {
-            warn!("VRAM_BOOST_RATIO invalid, using 0.90");
-            0.90
-        }),
-        Err(_) => 0.90,
+        Ok(v) => parse_boost_ratio(&v).ok_or_else(|| invalid(&v)),
+        Err(std::env::VarError::NotPresent) => Ok(0.90),
+        Err(std::env::VarError::NotUnicode(v)) => Err(invalid(&v.to_string_lossy())),
     }
 }
 
@@ -481,11 +487,20 @@ fn die(message: &str) -> ! {
     std::process::exit(1);
 }
 
+/// Exit status for a setting that is wrong (EX_CONFIG). The unit does not
+/// restart on it: starting again with the same setting cannot succeed.
+const EX_CONFIG: i32 = 78;
+
+fn die_config(message: &str) -> ! {
+    tracing::error!("{message}");
+    std::process::exit(EX_CONFIG);
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let boost_ratio = read_boost_ratio();
+    let boost_ratio = read_boost_ratio().unwrap_or_else(|e| die_config(&e));
     let (drm_key, vram_total) = match read_dmem_capacity() {
         Ok(v) => v,
         Err(e) => die(&e),
