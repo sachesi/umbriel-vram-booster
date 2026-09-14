@@ -98,11 +98,14 @@ impl Inner {
         }
         let label = unit_label(&cgroup).to_string();
         info!("the boost on {label} was reverted from outside, applying it again");
-        if matches!(
-            write_dmem_low(&cgroup, &self.drm_key, boost).await,
-            Ok(WriteOutcome::Wrote)
-        ) {
-            return true;
+        match write_dmem_low(&cgroup, &self.drm_key, boost).await {
+            Ok(WriteOutcome::Wrote) => return true,
+            // The write can still land: keep the cgroup, as handle_focus does.
+            Ok(WriteOutcome::TimedOut) => {
+                warn!("re-applying the boost on {label} did not finish in 2 s");
+                return false;
+            }
+            _ => {}
         }
         warn!("cannot re-apply the boost on {label}; resolving the window again");
         self.boosted_cgroup = None;
@@ -151,8 +154,11 @@ impl Inner {
                 false
             }
             Ok(WriteOutcome::TimedOut) => {
+                // The write can still land after this: keep the cgroup, so the
+                // next clear reaches it instead of leaving a boost behind that
+                // nothing knows about.
                 warn!("cannot boost {label}: the write to dmem.low did not finish in 2 s");
-                false
+                return false;
             }
             Err(e) => {
                 warn!("cannot boost {label}: {e}");
@@ -490,8 +496,11 @@ async fn main() {
         _ = sigint.recv() => info!("received SIGINT"),
     }
 
+    // Taking the lock first lets a write in progress finish: aborted halfway,
+    // it would still land on the blocking pool, possibly after the clear.
+    let mut guard = inner.lock().await;
     follower.abort();
-    inner.lock().await.clear_boost().await;
+    guard.clear_boost().await;
     info!("cleanup done, exiting");
 }
 
