@@ -30,6 +30,9 @@ RestartPreventExitStatus=78
 #   ProtectHome=true           -> empties /run/user as well as /home, which
 #                                 hides both the session bus and the Umbriel
 #                                 socket; the daemon cannot start with it
+#   IPAddressDeny=any          -> needs root, a user manager ignores it with a
+#                                 warning; RestrictAddressFamilies=AF_UNIX
+#                                 already keeps the daemon off IP
 # ReadWritePaths stays the whole cgroup tree: the daemon itself refuses any
 # cgroup outside this user's own user-<uid>.slice.
 NoNewPrivileges=true
@@ -43,7 +46,6 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_UNIX
-IPAddressDeny=any
 LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
