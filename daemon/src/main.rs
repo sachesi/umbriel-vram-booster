@@ -634,14 +634,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("uvb-inner-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let fifo = dir.join("dmem.low");
-        assert!(
-            std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .unwrap()
-                .success()
-        );
+        let fifo = cgroup::fifo::make(&dir);
         let key = "drm/0000:2d:00.0/vram";
         let mut inner = Inner {
             boosted_cgroup: None,
@@ -664,15 +657,7 @@ mod tests {
 
         inner.clear_boost().await;
         assert_eq!(inner.unconfirmed, None);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            let mut seen = String::new();
-            while seen.lines().count() < 2 {
-                seen += &std::fs::read_to_string(&fifo).unwrap();
-            }
-            let _ = tx.send(seen);
-        });
-        let seen = tokio::time::timeout(Duration::from_secs(5), rx)
+        let seen = tokio::time::timeout(Duration::from_secs(5), cgroup::fifo::read_lines(fifo, 2))
             .await
             .expect("the FIFO never saw both writes")
             .unwrap();

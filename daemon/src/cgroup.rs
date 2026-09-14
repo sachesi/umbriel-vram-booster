@@ -290,6 +290,48 @@ pub(crate) fn find_app_scope_for_pid(
     check(pid, 0, max_depth, deadline)
 }
 
+/// A FIFO as `dmem.low`: every write to it blocks until it is read, which
+/// makes a hung write on demand.
+#[cfg(test)]
+pub(crate) mod fifo {
+    use std::io::Read;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    pub(crate) fn make(dir: &Path) -> PathBuf {
+        let fifo = dir.join("dmem.low");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(made.unwrap().success());
+        fifo
+    }
+
+    /// Read `lines` lines from the FIFO on a thread of its own, through one
+    /// descriptor. Reopening it per write would race the next write: one that
+    /// opens just before the reader closes lands in a pipe nobody reads, and
+    /// the reader waits for it forever.
+    pub(crate) fn read_lines(
+        fifo: PathBuf,
+        lines: usize,
+    ) -> tokio::sync::oneshot::Receiver<String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let mut file = std::fs::File::open(&fifo).unwrap();
+            let mut seen = String::new();
+            let mut buf = [0u8; 256];
+            while seen.lines().count() < lines {
+                match file.read(&mut buf).unwrap() {
+                    // no writer at the moment; the next one does not wait,
+                    // since this descriptor keeps a reader on the FIFO
+                    0 => std::thread::sleep(Duration::from_millis(1)),
+                    n => seen.push_str(std::str::from_utf8(&buf[..n]).unwrap()),
+                }
+            }
+            let _ = tx.send(seen);
+        });
+        rx
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,14 +405,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("uvb-fifo-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let fifo = dir.join("dmem.low");
-        assert!(
-            std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .unwrap()
-                .success()
-        );
+        let fifo = fifo::make(&dir);
         let path = dir.to_string_lossy().into_owned();
         let key = "drm/0000:2d:00.0/vram";
         let writer = DmemWriter::new(Duration::from_millis(100));
@@ -382,19 +417,10 @@ mod tests {
         );
         // the clear is queued behind it before anything reads the FIFO
         let clear = writer.write(&path, key, 0);
+        // started only once the clear is queued; a plain thread, so a read
+        // that never ends fails on the timeout instead of hanging the test
         let read = async move {
-            // A plain thread, so a read that never ends fails the test on the
-            // timeout below instead of hanging it. Each write opens and closes
-            // the FIFO; one read may see one write or both.
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            std::thread::spawn(move || {
-                let mut seen = String::new();
-                while seen.lines().count() < 2 {
-                    seen += &fs::read_to_string(&fifo).unwrap();
-                }
-                let _ = tx.send(seen);
-            });
-            tokio::time::timeout(Duration::from_secs(5), rx).await
+            tokio::time::timeout(Duration::from_secs(5), fifo::read_lines(fifo, 2)).await
         };
         let (_, seen) = tokio::join!(clear, read);
         let seen = seen.expect("the FIFO never saw both writes").unwrap();
