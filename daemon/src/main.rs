@@ -14,7 +14,7 @@ use cgroup::{
     find_app_scope_for_pid, pid_comm, read_dmem_capacity, unit_label, write_dmem_low,
 };
 use matcher::find_app_scope_for_app_id;
-use umbriel::{Action, Tracker, umbriel_socket_path};
+use umbriel::{Action, Tracker, read_snapshots, umbriel_socket_path};
 
 fn parse_boost_ratio(raw: &str) -> Option<f64> {
     match raw.parse::<f64>() {
@@ -226,13 +226,10 @@ async fn apply_focus(inner: &Mutex<Inner>, scope: &Scope, pid: Option<u32>, app_
 /// backs off, so a session without Umbriel does not retry every three seconds
 /// for hours.
 async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>, overridden: Arc<AtomicBool>) {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::AsyncWriteExt;
 
     const FIRST_RETRY: Duration = Duration::from_secs(3);
     const MAX_RETRY: Duration = Duration::from_secs(60);
-    /// A `windows` snapshot is a few kilobytes. Reading further than this
-    /// would grow the buffer without a bound the peer respects.
-    const MAX_LINE: u64 = 1 << 20;
 
     let mut retry = FIRST_RETRY;
     let mut waiting = false;
@@ -280,70 +277,48 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>, overridden:
         waiting = false;
         retry = FIRST_RETRY;
         inner.lock().await.following = path.display().to_string();
-        // Fresh per connection: the boost was cleared when the last one went
-        // away, so the first snapshot has to arm it again rather than be
-        // recognised as the window that was already boosted.
-        let mut tracker = Tracker::default();
-
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let read = {
-                let mut limited = (&mut reader).take(MAX_LINE);
-                limited.read_line(&mut line).await
-            };
-            match read {
-                Ok(_) if line.is_empty() => break,
-                Ok(_) if !line.ends_with('\n') => {
-                    warn!(
-                        "Umbriel sent more than {MAX_LINE} bytes without a newline; reconnecting"
-                    );
-                    break;
+        // Reading and acting run side by side: a lookup can take most of a
+        // second, and a subscriber that stops reading for that long can be
+        // disconnected by Umbriel, which would drop the boost every time.
+        let (tx, mut rx) = tokio::sync::watch::channel(serde_json::Value::Null);
+        let act = async {
+            // Fresh per connection: the boost was cleared when the last one
+            // went away, so the first snapshot has to arm it again rather than
+            // be recognised as the window that was already boosted.
+            let mut tracker = Tracker::default();
+            while rx.changed().await.is_ok() {
+                let data = rx.borrow_and_update().clone();
+                // A FocusWindow or ClearFocus call changed the boost behind the
+                // tracker's back; forget what it remembers, so this snapshot is
+                // resolved afresh instead of skipped or checked against that boost.
+                if overridden.swap(false, Ordering::Relaxed) {
+                    tracker = Tracker::default();
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!("reading from Umbriel failed: {e}");
-                    break;
-                }
-            }
-            let v: serde_json::Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if let Some(err) = v["err"].as_str() {
-                tracing::error!(
-                    "Umbriel rejected the subscription: {}. Retrying every {} s.",
-                    loggable(err),
-                    MAX_RETRY.as_secs()
-                );
-                retry = MAX_RETRY;
-                break;
-            }
-            if v["event"] != "windows" {
-                continue;
-            }
-            // A FocusWindow or ClearFocus call changed the boost behind the
-            // tracker's back; forget what it remembers, so this snapshot is
-            // resolved afresh instead of skipped or checked against that boost.
-            if overridden.swap(false, Ordering::Relaxed) {
-                tracker = Tracker::default();
-            }
-            match tracker.next(&v["data"], Instant::now()) {
-                Action::Boost { pid, app_id, key } => {
-                    let boosted = apply_focus(&inner, &scope, pid, &app_id).await;
-                    tracker.record(key, boosted, Instant::now());
-                }
-                Action::Verify { key } => {
-                    if !inner.lock().await.verify_boost().await {
-                        // the cgroup is gone: fall back to the retry path so
-                        // the window is resolved again shortly
-                        tracker.record(key, false, Instant::now());
+                match tracker.next(&data, Instant::now()) {
+                    Action::Boost { pid, app_id, key } => {
+                        let boosted = apply_focus(&inner, &scope, pid, &app_id).await;
+                        tracker.record(key, boosted, Instant::now());
                     }
+                    Action::Verify { key } => {
+                        if !inner.lock().await.verify_boost().await {
+                            // the cgroup is gone: fall back to the retry path so
+                            // the window is resolved again shortly
+                            tracker.record(key, false, Instant::now());
+                        }
+                    }
+                    Action::Clear => inner.lock().await.clear_boost().await,
+                    Action::Skip => {}
                 }
-                Action::Clear => inner.lock().await.clear_boost().await,
-                Action::Skip => {}
             }
+        };
+        let (rejected, ()) = tokio::join!(read_snapshots(stream, tx), act);
+        if let Some(err) = rejected {
+            tracing::error!(
+                "Umbriel rejected the subscription: {}. Retrying every {} s.",
+                loggable(&err),
+                MAX_RETRY.as_secs()
+            );
+            retry = MAX_RETRY;
         }
 
         info!("the Umbriel stream closed; clearing the boost");

@@ -3,6 +3,9 @@
 
 use std::fs;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
+use tokio::sync::watch;
+use tracing::warn;
 
 /// Umbriel's IPC socket: `UMBRIEL_SOCKET`, else derived from `WAYLAND_DISPLAY`,
 /// else the newest `umbriel-*.sock` in the runtime dir, since a systemd user
@@ -39,6 +42,50 @@ fn socket_in_runtime_dir(
         })
         .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
         .map(|e| e.path())
+}
+
+/// Read Umbriel's stream until it ends, putting the data of each `windows`
+/// snapshot on `tx`. Reading never waits for a snapshot to be acted on: only
+/// the newest one matters, so one that is not taken in time is overwritten.
+/// Some(message) if Umbriel rejected the subscription.
+pub(crate) async fn read_snapshots<R: AsyncRead + Unpin>(
+    stream: R,
+    tx: watch::Sender<serde_json::Value>,
+) -> Option<String> {
+    /// A `windows` snapshot is a few kilobytes. Reading further than this
+    /// would grow the buffer without a bound the peer respects.
+    const MAX_LINE: u64 = 1 << 20;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = {
+            let mut limited = (&mut reader).take(MAX_LINE);
+            limited.read_line(&mut line).await
+        };
+        match read {
+            Ok(_) if line.is_empty() => return None,
+            Ok(_) if !line.ends_with('\n') => {
+                warn!("Umbriel sent more than {MAX_LINE} bytes without a newline; reconnecting");
+                return None;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("reading from Umbriel failed: {e}");
+                return None;
+            }
+        }
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(err) = v["err"].as_str() {
+            return Some(err.to_string());
+        }
+        if v["event"] == "windows" {
+            tx.send_replace(v["data"].take());
+        }
+    }
 }
 
 /// The window to boost from one `windows` snapshot: the seat-global `active`
@@ -189,6 +236,46 @@ mod tests {
             Some(derived)
         );
         let _ = fs::remove_dir_all(&run);
+    }
+
+    #[tokio::test]
+    async fn snapshots_are_read_while_nothing_acts_on_them() {
+        use tokio::io::AsyncWriteExt;
+        // a pipe far smaller than what is sent: the writes only finish if the
+        // reader drains it without anyone taking the snapshots
+        let (mut umbriel, daemon) = tokio::io::duplex(64);
+        let (tx, rx) = watch::channel(serde_json::Value::Null);
+        let reader = tokio::spawn(read_snapshots(daemon, tx));
+        let send = async {
+            umbriel
+                .write_all(b"{\"ok\":true}\nnot json\n")
+                .await
+                .unwrap();
+            for n in 0..100 {
+                let line = format!("{{\"event\":\"windows\",\"data\":[{{\"n\":{n}}}]}}\n");
+                umbriel.write_all(line.as_bytes()).await.unwrap();
+            }
+            umbriel
+                .write_all(b"{\"event\":\"workspaces\",\"data\":[]}\n")
+                .await
+                .unwrap();
+            drop(umbriel);
+        };
+        tokio::time::timeout(Duration::from_secs(5), send)
+            .await
+            .expect("the reader stopped draining the stream");
+        assert_eq!(reader.await.unwrap(), None);
+        assert_eq!(*rx.borrow(), serde_json::json!([{"n": 99}]));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_subscription_ends_the_read_with_the_reason() {
+        let stream: &[u8] = b"{\"err\":\"unknown subscription event: windows\"}\n";
+        let (tx, _rx) = watch::channel(serde_json::Value::Null);
+        assert_eq!(
+            read_snapshots(stream, tx).await.as_deref(),
+            Some("unknown subscription event: windows")
+        );
     }
 
     fn snapshot(app_id: &str, pid: i64) -> serde_json::Value {
