@@ -8,7 +8,7 @@ Type=dbus
 BusName=org.umbriel.VramBooster
 ExecStart=/usr/bin/umbriel-vram-booster
 Environment=RUST_LOG=warn
-# Environment=VRAM_BOOST_RATIO=0.90  # uncomment to override (0.0-1.0)
+# Environment=VRAM_BOOST_RATIO=0.90  # uncomment to override (above 0, up to 1)
 
 Restart=on-failure
 RestartSec=3

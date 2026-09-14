@@ -16,9 +16,11 @@ use cgroup::{
 use matcher::find_app_scope_for_app_id;
 use umbriel::{Action, Tracker, read_snapshots, umbriel_socket_path};
 
+/// Zero is refused: it would boost nothing, and startup cleanup, which looks
+/// for this daemon's own value, would take every unboosted unit for a stale boost.
 fn parse_boost_ratio(raw: &str) -> Option<f64> {
     match raw.parse::<f64>() {
-        Ok(r) if (0.0..=1.0).contains(&r) => Some(r),
+        Ok(r) if r > 0.0 && r <= 1.0 => Some(r),
         _ => None,
     }
 }
@@ -511,7 +513,8 @@ mod tests {
     #[test]
     fn parse_boost_ratio_bounds() {
         assert_eq!(parse_boost_ratio("0.85"), Some(0.85));
-        assert_eq!(parse_boost_ratio("0"), Some(0.0));
+        assert_eq!(parse_boost_ratio("0"), None);
+        assert_eq!(parse_boost_ratio("NaN"), None);
         assert_eq!(parse_boost_ratio("1"), Some(1.0));
         assert_eq!(parse_boost_ratio("1.5"), None);
         assert_eq!(parse_boost_ratio("-0.1"), None);
