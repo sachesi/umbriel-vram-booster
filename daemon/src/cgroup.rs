@@ -112,6 +112,24 @@ pub(crate) fn is_app_scope(cgroup_dir: &str) -> bool {
     cgroup_dir.split('/').any(|c| c == "app.slice")
 }
 
+/// The unit a cgroup under `app.slice` belongs to: the first component below
+/// it, through any sub-slices, that is not itself a slice. A process can sit
+/// deeper, in a cgroup a delegated unit made for itself; dmem protection is
+/// recursive, so boosting the unit covers it, and the unit is also what
+/// app_id matching resolves to. None outside `app.slice`, or in a slice.
+pub(crate) fn app_unit_cgroup(cgroup_dir: &str) -> Option<String> {
+    let (head, rest) = cgroup_dir.split_once("/app.slice/")?;
+    let mut unit = format!("{head}/app.slice");
+    for part in rest.split('/') {
+        unit.push('/');
+        unit.push_str(part);
+        if !part.ends_with(".slice") {
+            return Some(unit);
+        }
+    }
+    None
+}
+
 /// True if `content` (a dmem.low file body) sets `drm_key` to exactly `value`.
 pub(crate) fn dmem_low_has_value(content: &str, drm_key: &str, value: u64) -> bool {
     content.lines().any(|line| {
@@ -184,7 +202,7 @@ pub(crate) fn pid_comm(pid: u32) -> String {
     read_trimmed(&format!("/proc/{pid}/comm")).unwrap_or_default()
 }
 
-/// The app.slice cgroup of `pid`, or of one of its descendants up to
+/// The app.slice unit cgroup of `pid`, or of one of its descendants up to
 /// `max_depth`. Launchers commonly sit outside `app.slice` and put the app
 /// they started into a scope of its own.
 ///
@@ -202,9 +220,7 @@ pub(crate) fn find_app_scope_for_pid(
         if Instant::now() >= deadline {
             return None;
         }
-        if let Some(cg) = cgroup_path_for_pid(pid)
-            && is_app_scope(&cg)
-        {
+        if let Some(cg) = cgroup_path_for_pid(pid).and_then(|c| app_unit_cgroup(&c)) {
             return Some(cg);
         }
         if depth >= max_depth {
@@ -269,6 +285,29 @@ mod tests {
         assert!(!is_app_scope("/sys/fs/cgroup/user.slice/session.slice"));
         // substring that is not an exact path component must not match
         assert!(!is_app_scope("/sys/fs/cgroup/my-app.slice-x/foo"));
+    }
+
+    #[test]
+    fn app_unit_cgroup_stops_at_the_unit() {
+        let app = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice";
+        let unit = format!("{app}/app-foo.scope");
+        assert_eq!(app_unit_cgroup(&unit), Some(unit.clone()));
+        // a cgroup a delegated unit made for itself resolves to the unit
+        assert_eq!(
+            app_unit_cgroup(&format!("{unit}/container/payload")),
+            Some(unit)
+        );
+        let dbus = format!(
+            "{app}/app-dbus\\x2d:1.2\\x2dorg.gnome.Loupe.slice/dbus-:1.2-org.gnome.Loupe@0.service"
+        );
+        assert_eq!(app_unit_cgroup(&dbus), Some(dbus.clone()));
+        // a slice is never the unit, nor is anything outside app.slice
+        assert_eq!(app_unit_cgroup(&format!("{app}/app-x.slice")), None);
+        assert_eq!(app_unit_cgroup(app), None);
+        assert_eq!(
+            app_unit_cgroup("/sys/fs/cgroup/user.slice/user-1000.slice/session-2.scope"),
+            None
+        );
     }
 
     #[test]
