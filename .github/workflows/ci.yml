@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check and test
+    runs-on: ubuntu-latest
+    # The toolchain the COPR RPMs are built with.
+    container: registry.fedoraproject.org/fedora:44
+    steps:
+      - name: Install the build dependencies
+        run: >
+          dnf install -y --setopt=install_weak_deps=False
+          git-core rust cargo rustfmt clippy just
+      - uses: actions/checkout@v5
+      - name: Lint
+        run: just check
+      - name: Test
+        run: just test
+
+  deny:
+    name: Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: daemon/Cargo.toml
