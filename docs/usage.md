@@ -4,7 +4,13 @@
 
 The focused window receives VRAM priority (`dmem.low` set to VRAM × boost_ratio, default 90%). All other apps are set to zero. When focus switches, the previous app is reverted and the new one is boosted. Only apps with a systemd unit under `app.slice` can be boosted — see below.
 
-The boost ratio prevents starving the compositor and other GPU consumers. Override it in the systemd user service, not by running a second copy of the daemon by hand: the running instance owns the bus name, so a second one exits without doing anything.
+The daemon connects to Umbriel's socket (`UMBRIEL_SOCKET`, else `$XDG_RUNTIME_DIR/umbriel-$WAYLAND_DISPLAY.sock` if it exists, else the newest `umbriel-*.sock` there) and subscribes to `windows`. From every snapshot it takes the `active` window, which is keyboard focus across the seat; `focused` is per workspace. When Umbriel restarts, the boost is dropped, and the daemon reconnects and applies it again from the first snapshot. On SIGTERM or SIGINT it drops the boost and exits.
+
+The GPU is the largest `drm/` entry in `/sys/fs/cgroup/dmem.capacity`; set `DRM_KEY` in the unit to pick another one.
+
+If the daemon is killed without cleaning up (`SIGKILL`, a crash), a boost can be left behind. At startup it clears every `dmem.low` under `app.slice` in its own `user-<uid>.slice` that holds exactly its own boost value for the selected GPU; any other value is left alone.
+
+A ratio of 0.90 is aggressive: it leaves little headroom for the compositor and other GPU users. Lower it (0.80, say) if the compositor stutters or background apps are evicted. Override it in the systemd user service, not by running a second copy of the daemon by hand: the running instance owns the bus name, so a second one exits without doing anything.
 
 ```
 systemctl --user edit umbriel-vram-booster.service
