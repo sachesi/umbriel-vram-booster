@@ -1,0 +1,25 @@
+# cargo deny --manifest-path daemon/Cargo.toml check: known vulnerabilities,
+# licences that can go into a GPL-3.0-or-later program, and crates only from
+# crates.io.
+
+[graph]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+unmaintained = "workspace"
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "GPL-3.0-or-later",
+    "MIT",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
