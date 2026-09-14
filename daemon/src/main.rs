@@ -58,6 +58,9 @@ struct Scope {
 struct Inner {
     /// Cgroup that currently holds the boost.
     boosted_cgroup: Option<String>,
+    /// Cgroup whose boost write did not finish in time. It is not reported as
+    /// boosted, but the write can still land, so the next clear covers it too.
+    unconfirmed: Option<String>,
     /// Unit label of that cgroup, for ctl.
     current_unit: String,
     /// Umbriel socket the follower is reading, empty while it is waiting.
@@ -110,7 +113,8 @@ impl Inner {
     }
 
     async fn clear_boost(&mut self) {
-        if let Some(cgroup) = self.boosted_cgroup.take() {
+        let targets = self.boosted_cgroup.take().into_iter();
+        for cgroup in targets.chain(self.unconfirmed.take()) {
             let label = loggable(unit_label(&cgroup));
             match self.writer.write(&cgroup, &self.drm_key, 0).await {
                 Ok(WriteOutcome::Wrote) => info!("cleared the boost on {label}"),
@@ -141,15 +145,17 @@ impl Inner {
         info!("the boost on {label} was reverted from outside, applying it again");
         match self.writer.write(&cgroup, &self.drm_key, boost).await {
             Ok(WriteOutcome::Wrote) => return true,
-            // The write can still land: keep the cgroup, as handle_focus does.
             Ok(WriteOutcome::TimedOut) => {
-                warn!("re-applying the boost on {label} did not finish in 2 s");
-                return false;
+                warn!(
+                    "re-applying the boost on {label} did not finish in 2 s; resolving the window again"
+                );
+                self.unconfirmed = self.boosted_cgroup.take();
             }
-            _ => {}
+            _ => {
+                warn!("cannot re-apply the boost on {label}; resolving the window again");
+                self.boosted_cgroup = None;
+            }
         }
-        warn!("cannot re-apply the boost on {label}; resolving the window again");
-        self.boosted_cgroup = None;
         self.current_unit.clear();
         false
     }
@@ -167,6 +173,11 @@ impl Inner {
         // cleaned for the log; ctl cleans what it prints of current_unit.
         let label = loggable(unit_label(&cgroup));
         let boost = self.boost_bytes();
+        // A timed-out write to this very cgroup needs no clear: it is about
+        // to be written again, behind that write.
+        if self.unconfirmed.as_deref() == Some(cgroup.as_str()) {
+            self.unconfirmed = None;
+        }
 
         // Same cgroup as last time. Trusting in-memory state would hide a
         // boost that something else reverted, so the file decides. Nothing is
@@ -197,11 +208,9 @@ impl Inner {
                 false
             }
             Ok(WriteOutcome::TimedOut) => {
-                // The write can still land after this: keep the cgroup, so the
-                // next clear reaches it instead of leaving a boost behind that
-                // nothing knows about.
                 warn!("cannot boost {label}: the write to dmem.low did not finish in 2 s");
-                return false;
+                self.unconfirmed = Some(cgroup.clone());
+                false
             }
             Err(e) => {
                 warn!("cannot boost {label}: {e}");
@@ -501,6 +510,7 @@ async fn main() {
     let cleanup_key = drm_key.clone();
     let inner = Arc::new(Mutex::new(Inner {
         boosted_cgroup: None,
+        unconfirmed: None,
         current_unit: String::new(),
         following: String::new(),
         drm_key,
@@ -576,6 +586,59 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A boost whose write hangs (a FIFO as dmem.low) is not reported, and
+    /// the next clear still goes to it, queued behind the hung write.
+    #[tokio::test]
+    async fn a_timed_out_boost_is_not_reported_but_still_cleared() {
+        let dir = std::env::temp_dir().join(format!("uvb-inner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("dmem.low");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let key = "drm/0000:2d:00.0/vram";
+        let mut inner = Inner {
+            boosted_cgroup: None,
+            unconfirmed: None,
+            current_unit: String::new(),
+            following: String::new(),
+            drm_key: key.to_string(),
+            vram_total: 100,
+            boost_ratio: 0.9,
+            writer: DmemWriter::new(Duration::from_millis(100)),
+            signal: None,
+            announced: Default::default(),
+        };
+        let cgroup = dir.to_string_lossy().into_owned();
+
+        assert!(!inner.handle_focus(Some(cgroup.clone()), "test").await);
+        assert_eq!(inner.boosted_cgroup, None);
+        assert_eq!(inner.current_unit, "");
+        assert_eq!(inner.unconfirmed.as_deref(), Some(cgroup.as_str()));
+
+        inner.clear_boost().await;
+        assert_eq!(inner.unconfirmed, None);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let mut seen = String::new();
+            while seen.lines().count() < 2 {
+                seen += &std::fs::read_to_string(&fifo).unwrap();
+            }
+            let _ = tx.send(seen);
+        });
+        let seen = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("the FIFO never saw both writes")
+            .unwrap();
+        assert_eq!(seen, format!("{key} 90\n{key} 0\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parse_boost_ratio_bounds() {
