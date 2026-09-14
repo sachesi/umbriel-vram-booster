@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
-use zbus::{connection, interface};
+use zbus::{SignalContext, connection, interface};
+use zvariant::Value;
 
 mod cgroup;
 mod matcher;
@@ -63,9 +65,45 @@ struct Inner {
     drm_key: String,
     vram_total: u64,
     boost_ratio: f64,
+    /// Where PropertiesChanged goes, once the bus connection is up.
+    signal: Option<SignalContext<'static>>,
+    /// CurrentUnit, BoostedCgroup and Following as clients last heard them.
+    announced: [String; 3],
 }
 
 impl Inner {
+    /// Emit PropertiesChanged for whatever changed since the last call. Called
+    /// once a change is complete, so a switch from one unit to another is one
+    /// signal rather than a clear and a boost.
+    async fn announce(&mut self) {
+        let now = [
+            self.current_unit.clone(),
+            self.boosted_cgroup.clone().unwrap_or_default(),
+            self.following.clone(),
+        ];
+        if now == self.announced {
+            return;
+        }
+        if let Some(ctxt) = &self.signal {
+            let names = ["CurrentUnit", "BoostedCgroup", "Following"];
+            let values = now.clone().map(Value::from);
+            let mut changed: HashMap<&str, &Value> = HashMap::new();
+            for (i, name) in names.into_iter().enumerate() {
+                if now[i] != self.announced[i] {
+                    changed.insert(name, &values[i]);
+                }
+            }
+            let iface =
+                zbus::names::InterfaceName::from_static_str_unchecked("org.umbriel.VramBooster");
+            if let Err(e) =
+                zbus::fdo::Properties::properties_changed(ctxt, iface, &changed, &[]).await
+            {
+                warn!("cannot emit PropertiesChanged: {e}");
+            }
+        }
+        self.announced = now;
+    }
+
     fn boost_bytes(&self) -> u64 {
         (self.vram_total as f64 * self.boost_ratio) as u64
     }
@@ -225,7 +263,10 @@ async fn apply_focus(inner: &Mutex<Inner>, scope: &Scope, pid: Option<u32>, app_
         Some(p) => format!("pid={p} ({}) app_id={}", loggable(&comm), loggable(app_id)),
         None => format!("app_id={}", loggable(app_id)),
     };
-    inner.lock().await.handle_focus(cgroup, &source).await
+    let mut guard = inner.lock().await;
+    let boosted = guard.handle_focus(cgroup, &source).await;
+    guard.announce().await;
+    boosted
 }
 
 /// Hold `subscribe windows` open on the Umbriel socket and boost whatever is
@@ -284,7 +325,11 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>, overridden:
         info!("following {}", path.display());
         waiting = false;
         retry = FIRST_RETRY;
-        inner.lock().await.following = path.display().to_string();
+        {
+            let mut guard = inner.lock().await;
+            guard.following = path.display().to_string();
+            guard.announce().await;
+        }
         // Reading and acting run side by side: a lookup can take most of a
         // second, and a subscriber that stops reading for that long can be
         // disconnected by Umbriel, which would drop the boost every time.
@@ -308,13 +353,23 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>, overridden:
                         tracker.record(key, boosted, Instant::now());
                     }
                     Action::Verify { key } => {
-                        if !inner.lock().await.verify_boost().await {
+                        let intact = {
+                            let mut guard = inner.lock().await;
+                            let intact = guard.verify_boost().await;
+                            guard.announce().await;
+                            intact
+                        };
+                        if !intact {
                             // the cgroup is gone: fall back to the retry path so
                             // the window is resolved again shortly
                             tracker.record(key, false, Instant::now());
                         }
                     }
-                    Action::Clear => inner.lock().await.clear_boost().await,
+                    Action::Clear => {
+                        let mut guard = inner.lock().await;
+                        guard.clear_boost().await;
+                        guard.announce().await;
+                    }
                     Action::Skip => {}
                 }
             }
@@ -334,6 +389,7 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>, overridden:
             let mut guard = inner.lock().await;
             guard.following.clear();
             guard.clear_boost().await;
+            guard.announce().await;
         }
         tokio::time::sleep(backoff(&mut retry)).await;
     }
@@ -358,7 +414,11 @@ impl VramBoosterService {
     }
 
     async fn clear_focus(&self) -> bool {
-        self.inner.lock().await.clear_boost().await;
+        {
+            let mut guard = self.inner.lock().await;
+            guard.clear_boost().await;
+            guard.announce().await;
+        }
         self.overridden.store(true, Ordering::Relaxed);
         true
     }
@@ -373,22 +433,22 @@ impl VramBoosterService {
         self.inner.lock().await.following.clone()
     }
 
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "const"))]
     async fn drm_key(&self) -> String {
         self.inner.lock().await.drm_key.clone()
     }
 
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "const"))]
     async fn vram_total(&self) -> u64 {
         self.inner.lock().await.vram_total
     }
 
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "const"))]
     async fn boost_ratio(&self) -> f64 {
         self.inner.lock().await.boost_ratio
     }
 
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "const"))]
     async fn boosted_bytes(&self) -> u64 {
         self.inner.lock().await.boost_bytes()
     }
@@ -443,6 +503,8 @@ async fn main() {
         drm_key,
         vram_total,
         boost_ratio,
+        signal: None,
+        announced: Default::default(),
     }));
 
     // The bus name is claimed before anything is written: a second instance
@@ -459,7 +521,7 @@ async fn main() {
                 },
             )
         });
-    let _conn = match conn {
+    let bus = match conn {
         Ok(builder) => match builder.build().await {
             Ok(c) => c,
             Err(zbus::Error::NameTaken) => {
@@ -471,6 +533,7 @@ async fn main() {
         },
         Err(e) => die(&format!("cannot set up the session bus connection: {e}")),
     };
+    inner.lock().await.signal = SignalContext::new(&bus, "/org/umbriel/VramBooster").ok();
 
     let cleared = cleanup_stale_boosts(&scope.user_root, &cleanup_key, boost_bytes);
     if cleared > 0 {
