@@ -87,7 +87,7 @@ busctl --user call org.umbriel.VramBooster /org/umbriel/VramBooster org.umbriel.
 busctl --user call org.umbriel.VramBooster /org/umbriel/VramBooster org.umbriel.VramBooster ClearFocus
 ```
 
-The next Umbriel event overrides whatever you set by hand.
+The next `windows` event from Umbriel (a focus or title change) resolves the active window again and replaces whatever you set by hand.
 
 ## Apps must live in `app.slice`
 

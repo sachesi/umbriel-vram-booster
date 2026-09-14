@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -224,7 +225,7 @@ async fn apply_focus(inner: &Mutex<Inner>, scope: &Scope, pid: Option<u32>, app_
 /// the initial snapshot after each (re)connect re-arms the boost. Waiting
 /// backs off, so a session without Umbriel does not retry every three seconds
 /// for hours.
-async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>) {
+async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>, overridden: Arc<AtomicBool>) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
     const FIRST_RETRY: Duration = Duration::from_secs(3);
@@ -322,6 +323,12 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>) {
             if v["event"] != "windows" {
                 continue;
             }
+            // A FocusWindow or ClearFocus call changed the boost behind the
+            // tracker's back; forget what it remembers, so this snapshot is
+            // resolved afresh instead of skipped or checked against that boost.
+            if overridden.swap(false, Ordering::Relaxed) {
+                tracker = Tracker::default();
+            }
             match tracker.next(&v["data"], Instant::now()) {
                 Action::Boost { pid, app_id, key } => {
                     let boosted = apply_focus(&inner, &scope, pid, &app_id).await;
@@ -352,6 +359,8 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>) {
 struct VramBoosterService {
     inner: Arc<Mutex<Inner>>,
     scope: Arc<Scope>,
+    /// Set after a manual call, so the next Umbriel snapshot replaces it.
+    overridden: Arc<AtomicBool>,
 }
 
 #[interface(name = "org.umbriel.VramBooster")]
@@ -360,11 +369,14 @@ impl VramBoosterService {
     /// itself from the Umbriel socket. pid `-1` means "none".
     async fn focus_window(&self, pid: String, app_id: String) -> bool {
         let pid: Option<u32> = pid.trim().parse().ok().filter(|p| *p > 0);
-        apply_focus(&self.inner, &self.scope, pid, app_id.trim()).await
+        let boosted = apply_focus(&self.inner, &self.scope, pid, app_id.trim()).await;
+        self.overridden.store(true, Ordering::Relaxed);
+        boosted
     }
 
     async fn clear_focus(&self) -> bool {
         self.inner.lock().await.clear_boost().await;
+        self.overridden.store(true, Ordering::Relaxed);
         true
     }
 
@@ -439,6 +451,7 @@ async fn main() {
         user_root,
     });
 
+    let overridden = Arc::new(AtomicBool::new(false));
     let cleanup_key = drm_key.clone();
     let inner = Arc::new(Mutex::new(Inner {
         boosted_cgroup: None,
@@ -459,6 +472,7 @@ async fn main() {
                 VramBoosterService {
                     inner: inner.clone(),
                     scope: scope.clone(),
+                    overridden: overridden.clone(),
                 },
             )
         });
@@ -484,7 +498,7 @@ async fn main() {
     }
 
     info!("ready on the session bus as org.umbriel.VramBooster");
-    let follower = tokio::spawn(follow_umbriel(inner.clone(), scope.clone()));
+    let follower = tokio::spawn(follow_umbriel(inner.clone(), scope.clone(), overridden));
 
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = match signal(SignalKind::terminate()) {
