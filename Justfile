@@ -14,7 +14,7 @@ bin_src     := "daemon/target/release/" + binary
 ctl_src     := "daemon/target/release/" + ctl
 bin_dest    := "/usr/bin/" + binary
 ctl_dest    := "/usr/bin/" + ctl
-service     := "packaging/usr/lib/systemd/user/" + binary + ".service"
+service     := "data/" + binary + ".service"
 service_dir := "/usr/lib/systemd/user"
 
 default:
