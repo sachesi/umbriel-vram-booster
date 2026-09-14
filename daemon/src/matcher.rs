@@ -251,7 +251,7 @@ pub(crate) fn find_app_scope_for_app_id(
             "app_id={}: {} matching units, using {}",
             crate::loggable(app_id),
             matches.len(),
-            unit_label(&matches[0].to_string_lossy())
+            crate::loggable(unit_label(&matches[0].to_string_lossy()))
         );
     }
     matches.first().map(|p| p.to_string_lossy().into_owned())

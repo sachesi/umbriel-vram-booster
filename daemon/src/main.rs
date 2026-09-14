@@ -110,7 +110,7 @@ impl Inner {
 
     async fn clear_boost(&mut self) {
         if let Some(cgroup) = self.boosted_cgroup.take() {
-            let label = unit_label(&cgroup);
+            let label = loggable(unit_label(&cgroup));
             match write_dmem_low(&cgroup, &self.drm_key, 0).await {
                 Ok(WriteOutcome::Wrote) => info!("cleared the boost on {label}"),
                 Ok(WriteOutcome::Missing) => {
@@ -136,7 +136,7 @@ impl Inner {
         if dmem_low_is(&cgroup, &self.drm_key, boost).await {
             return true;
         }
-        let label = unit_label(&cgroup).to_string();
+        let label = loggable(unit_label(&cgroup));
         info!("the boost on {label} was reverted from outside, applying it again");
         match write_dmem_low(&cgroup, &self.drm_key, boost).await {
             Ok(WriteOutcome::Wrote) => return true,
@@ -162,7 +162,9 @@ impl Inner {
             return false;
         };
 
-        let label = unit_label(&cgroup).to_string();
+        // A cgroup name is whatever the process that made it chose, so it is
+        // cleaned for the log; ctl cleans what it prints of current_unit.
+        let label = loggable(unit_label(&cgroup));
         let boost = self.boost_bytes();
 
         // Same cgroup as last time. Trusting in-memory state would hide a
@@ -180,7 +182,7 @@ impl Inner {
         // Remembered before the write, not after: if the daemon is stopped
         // mid-write, its exit still knows which cgroup to clear.
         self.boosted_cgroup = Some(cgroup.clone());
-        self.current_unit = label.clone();
+        self.current_unit = unit_label(&cgroup).to_string();
 
         let boosted = match write_dmem_low(&cgroup, &self.drm_key, boost).await {
             Ok(WriteOutcome::Wrote) => {
