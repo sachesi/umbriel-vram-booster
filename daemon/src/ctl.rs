@@ -7,8 +7,8 @@ umbriel-vram-boosterctl - show what umbriel-vram-booster is doing
 
 Usage: umbriel-vram-boosterctl [--help] [--version]
 
-Prints the daemon's GPU, boost size, the socket it follows and the unit that
-currently holds the boost. Takes no other arguments.";
+Prints the daemon's GPU, boost size, the ceiling it puts on app.slice, the
+socket it follows and the unit that currently holds the boost. Takes no other arguments.";
 
 /// Unit names and cgroup paths come from other processes, so they can carry
 /// control characters that would rewrite the terminal. Strip them.
@@ -100,6 +100,7 @@ async fn main() {
     let total = get_u64(&props, "VramTotal").unwrap_or(0);
     let boosted = get_u64(&props, "BoostedBytes").unwrap_or(0);
     let boost_ratio = get_f64(&props, "BoostRatio").unwrap_or(0.0);
+    let ceiling = get_u64(&props, "AppSliceCeiling").unwrap_or(0);
     let following = props.get("Following").map(format_val);
 
     println!("=== Umbriel VRAM Booster Status ===");
@@ -118,6 +119,15 @@ async fn main() {
     println!("VRAM total:       {}", human_bytes(total));
     println!("Boost ratio:      {:.0}%", boost_ratio * 100.0);
     println!("Boosted bytes:    {}", human_bytes(boosted));
+    if ceiling == 0 {
+        println!("App ceiling:      off");
+    } else {
+        println!(
+            "App ceiling:      {} ({} MiB reserved)",
+            human_bytes(ceiling),
+            total.saturating_sub(ceiling) / 1024 / 1024
+        );
+    }
     println!(
         "Current unit:     {}",
         props.get("CurrentUnit").map_or("(none)".into(), format_val)

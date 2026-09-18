@@ -1,6 +1,6 @@
 # umbriel-vram-booster
 
-Keeps the focused window's VRAM from being evicted on the [Umbriel](https://github.com/noctalia-dev/umbriel) compositor. A systemd `--user` daemon follows Umbriel's IPC socket and, through the Linux dmem cgroup controller, protects most of the VRAM for the active window's unit, taking the protection back from the window focused before. It matters most on GPUs with 8 GB or less, where whatever runs in the background can otherwise push the foreground app's buffers out to system memory.
+Keeps the focused window's VRAM from being evicted on the [Umbriel](https://github.com/noctalia-dev/umbriel) compositor. A systemd `--user` daemon follows Umbriel's IPC socket and, through the Linux dmem cgroup controller, protects most of the VRAM for the active window's unit, taking the protection back from the window focused before. It also caps `app.slice` a little below the VRAM size, so apps together cannot push the compositor's buffers out. It matters most on GPUs with 8 GB or less, where whatever runs in the background can otherwise push the foreground app's buffers out to system memory.
 
 It needs no root at runtime. It is the Umbriel counterpart of [gnome-vram-booster](https://github.com/sachesi/gnome-vram-booster), and experimental: it writes cgroup files, so try it on a setup you can afford to reboot.
 
@@ -32,6 +32,8 @@ prints the GPU, the boost size, the Umbriel socket the daemon follows and the un
 ```
 systemctl --user edit umbriel-vram-booster.service   # [Service] Environment=VRAM_BOOST_RATIO=0.80
 ```
+
+The cap on `app.slice` leaves 256 MiB to everything outside it; `VRAM_RESERVE_MIB` changes that, and `0` turns the cap off. See [docs/usage.md](docs/usage.md#the-ceiling-on-appslice).
 
 ## Documentation
 

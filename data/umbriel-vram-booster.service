@@ -9,6 +9,7 @@ BusName=org.umbriel.VramBooster
 ExecStart=/usr/bin/umbriel-vram-booster
 Environment=RUST_LOG=warn
 # Environment=VRAM_BOOST_RATIO=0.90  # uncomment to override (above 0, up to 1)
+# Environment=VRAM_RESERVE_MIB=256    # VRAM app.slice may not take; 0 turns the ceiling off
 
 Restart=on-failure
 RestartSec=3
@@ -16,12 +17,12 @@ RestartSec=3
 # restarting with it cannot help.
 RestartPreventExitStatus=78
 
-# Hardening. Runs as the session user (not root); dmem.low files under this
-# user's user@<uid>.service subtree are user-owned, so no capabilities are
-# needed to write them. Must preserve: reading /proc/<pid>/cgroup,
-# /proc/<pid>/task/*/children and /proc/<pid>/environ, writing
-# /sys/fs/cgroup/**/dmem.low, and connecting to the Umbriel IPC socket under
-# $XDG_RUNTIME_DIR (AF_UNIX).
+# Hardening. Runs as the session user (not root); dmem.low and dmem.max files
+# under this user's user@<uid>.service subtree are user-owned, so no
+# capabilities are needed to write them. Must preserve: reading
+# /proc/<pid>/cgroup, /proc/<pid>/task/*/children and /proc/<pid>/environ,
+# writing /sys/fs/cgroup/**/dmem.low and app.slice/dmem.max, and connecting
+# to the Umbriel IPC socket under $XDG_RUNTIME_DIR (AF_UNIX).
 #
 # Deliberately NOT set:
 #   ProtectControlGroups=true  -> /sys/fs/cgroup read-only, kills dmem.low writes

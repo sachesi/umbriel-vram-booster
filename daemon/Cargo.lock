@@ -898,6 +898,7 @@ dependencies = [
 name = "umbriel-vram-booster"
 version = "0.3.0"
 dependencies = [
+ "libc",
  "serde_json",
  "tokio",
  "tracing",

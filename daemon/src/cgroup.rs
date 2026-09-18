@@ -1,5 +1,5 @@
-//! Reading dmem capacity and writing `dmem.low`, plus the `/proc` lookups
-//! that map a pid to its systemd unit cgroup.
+//! Reading dmem capacity and writing `dmem.low` and `dmem.max`, plus the
+//! `/proc` lookups that map a pid to its systemd unit cgroup.
 
 use std::fs;
 use std::time::{Duration, Instant};
@@ -66,8 +66,8 @@ pub(crate) fn cgroup_path_for_pid(pid: u32) -> Option<String> {
     None
 }
 
-/// What a `dmem.low` write did, so a caller can tell a scope that has no
-/// `dmem.low` from one whose write did not finish in time.
+/// What a dmem write did, so a caller can tell a cgroup that has no such
+/// file from one whose write did not finish in time.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum WriteOutcome {
     Wrote,
@@ -75,14 +75,33 @@ pub(crate) enum WriteOutcome {
     TimedOut,
 }
 
-/// One `dmem.low` write, carried out on the writer thread.
+/// One dmem write, carried out on the writer thread.
 struct Job {
     file: String,
     body: String,
+    /// Open with O_NONBLOCK. For `dmem.max` that stops a kernel which
+    /// reclaims down to a lowered limit (7.3 and later) from evicting in the
+    /// write: the limit takes effect at once, and usage shrinks as buffers
+    /// are freed. Older kernels ignore the flag.
+    nonblock: bool,
     done: tokio::sync::oneshot::Sender<std::io::Result<WriteOutcome>>,
 }
 
-/// Writes `dmem.low` files on a thread of its own, one at a time and in the
+fn write_file(file: &str, body: &str, nonblock: bool) -> std::io::Result<()> {
+    if !nonblock {
+        return fs::write(file, body);
+    }
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(file)?
+        .write_all(body.as_bytes())
+}
+
+/// Writes dmem files on a thread of its own, one at a time and in the
 /// order they were asked for. A write that hangs holds up the ones behind it
 /// instead of being overtaken, so a clear queued after a boost can never
 /// land first and leave the boost in place. Waiting for a write is bounded;
@@ -100,7 +119,7 @@ impl DmemWriter {
                 let outcome = if fs::metadata(&job.file).is_err() {
                     Ok(WriteOutcome::Missing)
                 } else {
-                    fs::write(&job.file, job.body).map(|()| WriteOutcome::Wrote)
+                    write_file(&job.file, &job.body, job.nonblock).map(|()| WriteOutcome::Wrote)
                 };
                 let _ = job.done.send(outcome);
             }
@@ -108,20 +127,50 @@ impl DmemWriter {
         Self { jobs, timeout }
     }
 
+    /// Set `dmem.low` of `cgroup_dir` for `drm_key`.
     pub(crate) async fn write(
         &self,
         cgroup_dir: &str,
         drm_key: &str,
         bytes: u64,
     ) -> std::io::Result<WriteOutcome> {
+        self.queue(
+            cgroup_dir,
+            "dmem.low",
+            format!("{drm_key} {bytes}\n"),
+            false,
+        )
+        .await
+    }
+
+    /// Set `dmem.max` of `cgroup_dir` for `drm_key`; None lifts it.
+    pub(crate) async fn write_max(
+        &self,
+        cgroup_dir: &str,
+        drm_key: &str,
+        bytes: Option<u64>,
+    ) -> std::io::Result<WriteOutcome> {
+        let value = bytes.map_or_else(|| "max".to_string(), |b| b.to_string());
+        self.queue(cgroup_dir, "dmem.max", format!("{drm_key} {value}\n"), true)
+            .await
+    }
+
+    async fn queue(
+        &self,
+        cgroup_dir: &str,
+        name: &str,
+        body: String,
+        nonblock: bool,
+    ) -> std::io::Result<WriteOutcome> {
         if cgroup_dir.contains("..") {
             return Ok(WriteOutcome::Missing);
         }
-        let gone = || std::io::Error::other("the dmem.low writer thread is gone");
+        let gone = || std::io::Error::other("the dmem writer thread is gone");
         let (done, outcome) = tokio::sync::oneshot::channel();
         let job = Job {
-            file: format!("{cgroup_dir}/dmem.low"),
-            body: format!("{drm_key} {bytes}\n"),
+            file: format!("{cgroup_dir}/{name}"),
+            body,
+            nonblock,
             done,
         };
         self.jobs.send(job).map_err(|_| gone())?;
@@ -161,6 +210,18 @@ pub(crate) fn app_unit_cgroup(cgroup_dir: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// What `content` (a dmem.low or dmem.max file body) sets `drm_key` to: a
+/// number of bytes, or `max`. None if the region is not listed.
+pub(crate) fn dmem_entry<'a>(content: &'a str, drm_key: &str) -> Option<&'a str> {
+    content.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some(k), Some(v)) if k == drm_key => Some(v),
+            _ => None,
+        }
+    })
 }
 
 /// True if `content` (a dmem.low file body) sets `drm_key` to exactly `value`.

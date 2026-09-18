@@ -6,6 +6,8 @@ The focused window receives VRAM priority (`dmem.low` set to VRAM × boost_ratio
 
 The daemon connects to Umbriel's socket (`UMBRIEL_SOCKET`, else `$XDG_RUNTIME_DIR/umbriel-$WAYLAND_DISPLAY.sock` if it exists, else the newest `umbriel-*.sock` there) and subscribes to `windows`. From every snapshot it takes the `active` window, which is keyboard focus across the seat; `focused` is per workspace. When Umbriel restarts, the boost is dropped, and the daemon reconnects and applies it again from the first snapshot. On SIGTERM or SIGINT it drops the boost and exits.
 
+The daemon also puts a ceiling on `app.slice` as a whole; see [below](#the-ceiling-on-appslice).
+
 The GPU is the largest `drm/` entry in `/sys/fs/cgroup/dmem.capacity`; set `DRM_KEY` in the unit to pick another one.
 
 If the daemon is killed without cleaning up (`SIGKILL`, a crash), a boost can be left behind. At startup it clears every `dmem.low` under `app.slice` in its own `user-<uid>.slice` that holds exactly its own boost value for the selected GPU; any other value is left alone.
@@ -25,6 +27,29 @@ Environment=VRAM_BOOST_RATIO=0.85
 
 Then `systemctl --user restart umbriel-vram-booster.service`.
 
+## The ceiling on `app.slice`
+
+`dmemcg-booster` sets `dmem.low` on `app.slice` to the whole of VRAM, and nothing on the compositor's cgroup, which is outside `app.slice` (in `session.slice` or a login session scope). Once VRAM is full, the kernel evicts unprotected buffers first, so the apps as a group can push out the compositor's buffers. The daemon sets `app.slice`'s `dmem.max` to VRAM less a reserve, 256 MiB by default:
+
+```
+[Service]
+Environment=VRAM_RESERVE_MIB=512
+```
+
+`0` turns the ceiling off. A reserve as large as the VRAM stops the daemon from starting.
+
+When `app.slice` reaches the ceiling, the kernel evicts inside `app.slice`, where the focused unit's `dmem.low` still protects it, and a new buffer that does not fit goes to system memory. Nothing outside `app.slice` is limited: a compositor that itself runs inside `app.slice` gets nothing from the ceiling.
+
+The daemon writes the ceiling at startup and checks it at every focus change, since `app.slice` is made anew when the user manager restarts. Up to Linux 7.2, the kernel keeps the old limit without an error if `app.slice` already uses more than the ceiling; the daemon notices and tries again at the next focus change. Linux 7.3 applies it at once. The daemon never evicts to make room: the write is non-blocking.
+
+A `dmem.max` on `app.slice` that the daemon did not write is left alone, with a warning. On exit it restores `max`, if the ceiling there is still its own. A daemon killed outright leaves its ceiling behind; the next start takes it over, unless `VRAM_RESERVE_MIB` changed in between, in which case logging out and in clears it.
+
+```
+cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/dmem.max
+```
+
+The reserve is a guess, not a measurement. Too small and the compositor still loses buffers; too large and games spill into system memory earlier than they need to.
+
 ## Daemon status
 
 ```
@@ -41,6 +66,7 @@ DRM key:          drm/0000:2d:00.0/vram
 VRAM total:       8573157376 (8176 MiB, 7.98 GiB)
 Boost ratio:      90%
 Boosted bytes:    7715841638 (7358 MiB, 7.19 GiB)
+App ceiling:      8304721920 (7920 MiB, 7.73 GiB) (256 MiB reserved)
 Current unit:     app-flatpak-org.mozilla.firefox-1126565164.scope
 Boosted cgroup:   /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-org.mozilla.firefox-1126565164.scope
 ```
@@ -149,11 +175,15 @@ systemctl --user edit umbriel-vram-booster.service
 
 **Daemon fails to start**
 
-Common cause: `dmemcg-booster` is not running, or `dmem` is not in `cgroup.controllers`. The journal names the reason; a `VRAM_BOOST_RATIO` that is not a number above 0 and at most 1 stops it too.
+Common cause: `dmemcg-booster` is not running, or `dmem` is not in `cgroup.controllers`. The journal names the reason; a `VRAM_BOOST_RATIO` that is not a number above 0 and at most 1, or a `VRAM_RESERVE_MIB` that is not a whole number below the VRAM size, stops it too.
 
 **"Failed to boost ... dmem.low missing"**
 
 The user `dmemcg-booster.service` has not propagated the controller into app units. Check `systemctl --user status dmemcg-booster.service`.
+
+**"app.slice already has dmem.max=..."**
+
+Something else, such as a oneshot service from a VRAM tuning guide, set a limit on `app.slice`. The daemon leaves it; remove the other setup, or set `VRAM_RESERVE_MIB=0` to keep it.
 
 **"Permission denied" writing dmem.low**
 
