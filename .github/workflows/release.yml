@@ -1,0 +1,84 @@
+name: Release
+
+# A release tag gets a GitHub release, once CI has passed (ci.yml calls this). The tag
+# must agree with the version in the sources; its notes list the fixes and features
+# committed since the previous tag. The release carries the crates the build needs, for
+# building without a network.
+on:
+  workflow_call:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish the release
+    runs-on: ubuntu-latest
+    env:
+      NAME: umbriel-vram-booster
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The notes need the history back to the previous tag.
+          fetch-depth: 0
+      - name: Check the version and write the notes
+        run: |
+          python3 - <<'EOF'
+          import os, re, subprocess, sys, tomllib
+
+          def toml(path, *keys):
+              with open(path, "rb") as f:
+                  value = tomllib.load(f)
+              for key in keys:
+                  value = value[key]
+              return path, value
+
+          def lock(path, name):
+              with open(path, "rb") as f:
+                  found = [p["version"] for p in tomllib.load(f)["package"] if p["name"] == name]
+              return f"{name} in {path}", found[0]
+
+          tag = os.environ["TAG"].removeprefix("v")
+          found = [
+              toml("daemon/Cargo.toml", "package", "version"),
+              lock("daemon/Cargo.lock", "umbriel-vram-booster"),
+          ]
+          wrong = [f"{where} says {v}" for where, v in found if v != tag]
+          if wrong:
+              sys.exit(f"The tag is {tag}, but " + ", ".join(wrong))
+
+          def git(*args):
+              return subprocess.run(["git", *args], capture_output=True, text=True).stdout.strip()
+
+          previous = git("describe", "--tags", "--abbrev=0", os.environ["TAG"] + "^")
+          span = f"{previous}..{os.environ['TAG']}" if previous else os.environ["TAG"]
+          subjects = git("log", "--no-merges", "--format=%s", span).splitlines()
+          picked = [s for s in subjects if re.match(r"(feat|fix|perf)(\(.*\))?!?:", s)] or [
+              s for s in subjects if not re.match(r"(chore|ci)(\(.*\))?!?:", s)
+          ]
+          notes = ["\n".join(f"- {s}" for s in picked)]
+          with open(os.environ["RUNNER_TEMP"] + "/notes.md", "w") as f:
+              f.write("\n\n".join(notes) + "\n")
+          EOF
+      - name: Vendor the crates
+        run: |
+          dir="$NAME-${TAG#v}"
+          mkdir -p "$dir/.cargo"
+          cargo vendor --manifest-path daemon/Cargo.toml --locked --versioned-dirs "$dir/vendor" > "$dir/.cargo/config.toml"
+          # Paths relative to the source tree, so the tarball unpacks over it.
+          sed -i 's|^directory = .*|directory = "vendor"|' "$dir/.cargo/config.toml"
+          tar --sort=name --mtime="@$(git log -1 --format=%ct)" --owner=0 --group=0 --numeric-owner \
+            -cJf "$dir-vendor.tar.xz" "$dir"
+          sha256sum "$dir-vendor.tar.xz" > SHA256SUMS
+      - name: Publish
+        run: |
+          files=("$NAME-${TAG#v}-vendor.tar.xz" SHA256SUMS)
+          # A release that already exists keeps its notes, which may have been edited by hand.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber "${files[@]}"
+          else
+            gh release create "$TAG" --verify-tag --title "umbriel-vram-booster ${TAG#v}" \
+              --notes-file "$RUNNER_TEMP/notes.md" "${files[@]}"
+          fi

@@ -1,0 +1,19 @@
+# Weekly pull requests for the actions the workflows use, pinned by commit, and for the
+# crates in Cargo.lock. Minor and patch updates of crates come as one pull request.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+  - package-ecosystem: cargo
+    directory: /daemon
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build
+    groups:
+      crates:
+        update-types: [minor, patch]
