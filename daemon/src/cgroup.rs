@@ -27,7 +27,7 @@ pub(crate) fn parse_dmem_capacity(content: &str) -> Vec<(String, u64)> {
 pub(crate) fn read_dmem_capacity() -> Result<(String, u64), String> {
     let content = fs::read_to_string("/sys/fs/cgroup/dmem.capacity").map_err(|e| {
         format!(
-            "cannot read /sys/fs/cgroup/dmem.capacity: {e}. Does this kernel have the dmem controller (6.12+)?"
+            "cannot read /sys/fs/cgroup/dmem.capacity: {e}. Does this kernel have the dmem controller (6.14+, 6.15+ for amdgpu)?"
         )
     })?;
     let entries = parse_dmem_capacity(&content);

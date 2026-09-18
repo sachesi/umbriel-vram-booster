@@ -6,7 +6,7 @@ It needs no root at runtime. It is the Umbriel counterpart of [gnome-vram-booste
 
 ## Requirements
 
-- Linux 6.12 or newer with the `dmem` cgroup controller.
+- Linux 6.15 or newer, the first where amdgpu reports VRAM to the `dmem` cgroup controller (the controller came in 6.14). Up to 7.2, protection only decides what is evicted when a buffer moves back into VRAM, while a new buffer that finds VRAM full still goes to system memory; from 7.3, or with the patches CachyOS ships, a protected app's new buffer evicts unprotected ones instead, which is where most of the gain is.
 - [dmemcg-booster](https://pixelcluster.github.io/VRAM-Mgmt-fixed/), both its system and its user service.
 - Umbriel. A build that reports `pid` in its `windows` events ([#166](https://github.com/noctalia-dev/umbriel/pull/166)) resolves Wayland windows exactly; an older one falls back to matching app ids.
 - An AMD GPU on `amdgpu`. Intel is untested; NVIDIA's proprietary driver is untested and likely lacks dmem support.

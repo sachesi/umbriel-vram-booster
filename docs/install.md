@@ -10,7 +10,7 @@ Verify support:
 cat /sys/fs/cgroup/cgroup.controllers
 ```
 
-The output must include `dmem`. Requires kernel 6.12 or newer. Distributions known to ship it: CachyOS, Nobara, Bazzite.
+The output must include `dmem`. The controller came in kernel 6.14, and amdgpu uses it from 6.15; for what changes with 7.3, see the [README](../README.md#requirements). Distributions known to ship it: CachyOS, Nobara, Bazzite.
 
 **2. dmemcg-booster**
 

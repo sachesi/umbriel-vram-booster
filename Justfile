@@ -43,7 +43,7 @@ check-bins:
 # Check the kernel, dmemcg-booster and Umbriel this machine runs.
 check-deps:
     @grep -qw dmem /sys/fs/cgroup/cgroup.controllers || \
-        { echo "error: 'dmem' controller missing from /sys/fs/cgroup/cgroup.controllers; needs kernel 6.12+ with dmem cgroup support" >&2; exit 1; }
+        { echo "error: 'dmem' controller missing from /sys/fs/cgroup/cgroup.controllers; needs kernel 6.14+ with dmem cgroup support, 6.15+ for amdgpu" >&2; exit 1; }
     @systemctl is-active --quiet dmemcg-booster.service || \
         { echo "error: system dmemcg-booster.service is not active; run: sudo systemctl enable --now dmemcg-booster.service" >&2; exit 1; }
     @systemctl --user is-active --quiet dmemcg-booster.service || \
