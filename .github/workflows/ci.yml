@@ -44,3 +44,6 @@ jobs:
     needs: [check, deny]
     if: startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/aur.yml
+    # A called workflow sees no secrets, its environment's included, unless the
+    # caller passes them on.
+    secrets: inherit

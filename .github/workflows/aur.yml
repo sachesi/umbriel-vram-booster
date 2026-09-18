@@ -26,8 +26,8 @@ jobs:
     name: Update the AUR package
     runs-on: ubuntu-latest
     container: archlinux:base-devel
-    # AUR_SSH_KEY lives in this environment, not in the repository; a caller cannot pass
-    # it, and does not need to.
+    # AUR_SSH_KEY lives in this environment, not in the repository. Called from ci.yml it
+    # is only visible with `secrets: inherit` there.
     environment: aur
     env:
       PKGNAME: umbriel-vram-booster
