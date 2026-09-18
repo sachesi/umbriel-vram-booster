@@ -1,6 +1,6 @@
 # umbriel-vram-booster
 
-Keeps the focused window's VRAM from being evicted on the [Umbriel](https://github.com/noctalia-dev/umbriel) compositor. A systemd `--user` daemon follows Umbriel's IPC socket and, through the Linux dmem cgroup controller, protects most of the VRAM for the active window's unit, taking the protection back from the window focused before. It matters most on GPUs with 8 GB or less, where whatever runs in the background can otherwise push the foreground app's buffers out to system memory.
+Keeps the focused window's VRAM from being evicted on the [Umbriel](https://github.com/noctalia-dev/umbriel) compositor. A systemd `--user` daemon follows Umbriel's IPC socket and, through the Linux dmem cgroup controller, protects most of the VRAM for the active window's unit, taking the protection back from the window focused before, and protects `session.slice`, where the compositor usually runs, from background apps. It matters most on GPUs with 8 GB or less, where whatever runs in the background can otherwise push the foreground app's buffers out to system memory.
 
 It needs no root at runtime. It is the Umbriel counterpart of [gnome-vram-booster](https://github.com/sachesi/gnome-vram-booster), and experimental: it writes cgroup files, so try it on a setup you can afford to reboot.
 

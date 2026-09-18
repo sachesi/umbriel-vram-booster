@@ -20,7 +20,8 @@ daemon/src/main.rs      the daemon: state, the D-Bus service, following the Umbr
 daemon/src/umbriel.rs   where the socket is, reading its stream, which window a snapshot
                         makes active, and the Tracker that decides what each snapshot
                         is worth acting on
-daemon/src/cgroup.rs    dmem.capacity, dmem.low and dmem.max, pid to cgroup through /proc,
+daemon/src/cgroup.rs    dmem.capacity, dmem.low and dmem.max, what is kept on session.slice
+                        and app.slice, pid to cgroup through /proc,
                         startup cleanup of stale boosts
 daemon/src/matcher.rs   app_id to an app.slice unit, for X11 windows without a pid
 daemon/src/ctl.rs       umbriel-vram-boosterctl, reads the daemon's D-Bus properties
@@ -28,8 +29,8 @@ data/                   the systemd user unit
 docs/                   installing, using and troubleshooting
 ```
 
-The daemon writes only below its own `user-<uid>.slice`: `dmem.low` of app units, and
-`dmem.max` of `app.slice`. What it
+The daemon writes only below its own `user-<uid>.slice`: `dmem.low` of app units and of
+`session.slice`, and `dmem.max` of `app.slice`. What it
 reads from a window or another process (app ids, unit names, `comm`, environments) is
 untrusted: app ids, unit names and `comm` go through `loggable()` before they reach a
 log line, and resolving a focused window is bounded by a deadline, since it walks `/proc`

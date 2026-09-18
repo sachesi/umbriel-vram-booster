@@ -6,7 +6,7 @@ The focused window receives VRAM priority (`dmem.low` set to VRAM × boost_ratio
 
 The daemon connects to Umbriel's socket (`UMBRIEL_SOCKET`, else `$XDG_RUNTIME_DIR/umbriel-$WAYLAND_DISPLAY.sock` if it exists, else the newest `umbriel-*.sock` there) and subscribes to `windows`. From every snapshot it takes the `active` window, which is keyboard focus across the seat; `focused` is per workspace. When Umbriel restarts, the boost is dropped, and the daemon reconnects and applies it again from the first snapshot. On SIGTERM or SIGINT it drops the boost and exits.
 
-The daemon can also put a ceiling on `app.slice` as a whole; see [below](#the-ceiling-on-appslice).
+The daemon also protects `session.slice`, and can put a ceiling on `app.slice` as a whole; see [below](#protecting-the-compositor).
 
 The GPU is the largest `drm/` entry in `/sys/fs/cgroup/dmem.capacity`; set `DRM_KEY` in the unit to pick another one.
 
@@ -27,11 +27,22 @@ Environment=VRAM_BOOST_RATIO=0.85
 
 Then `systemctl --user restart umbriel-vram-booster.service`.
 
+## Protecting the compositor
+
+`dmemcg-booster` sets `dmem.low` on `app.slice` to the whole of VRAM, and nothing on its sibling `session.slice`. The kernel weighs protection between siblings, so next to `app.slice`, everything in `session.slice` is unprotected: once VRAM is full, any app's buffers, background apps' included, can push out a compositor running there (under uwsm, for one). The daemon therefore sets `session.slice`'s `dmem.low` to the whole of VRAM as well, which puts the compositor on a par with `app.slice`: the focused app evicts background apps' buffers first, and the compositor's only when nothing unprotected is left and a buffer moves back into VRAM. The rest of `session.slice` (portals, the notification daemon, Xwayland) is covered too; it holds little VRAM.
+
+A compositor started in a login session scope (`session-N.scope`) already has this from the system `dmemcg-booster`, and one inside `app.slice` gets nothing from it. `VRAM_PROTECT_SESSION=0` turns it off:
+
+```
+[Service]
+Environment=VRAM_PROTECT_SESSION=0
+```
+
+The daemon writes it only where `session.slice`'s `dmem.low` is 0, leaves a value someone else set alone, and puts 0 back at exit while the value is still its own, like the ceiling below.
+
 ## The ceiling on `app.slice`
 
-Off by default. `dmemcg-booster` sets `dmem.low` on `app.slice` to the whole of VRAM. A compositor in `session.slice` (under uwsm, for one) gets nothing, so once VRAM is full, apps' buffers can push its buffers out; background apps' too, since `app.slice`'s protection covers them. A compositor started in a login session scope (`session-N.scope`) gets the same whole-VRAM `dmem.low` from the system `dmemcg-booster`, and has less to gain here.
-
-`VRAM_RESERVE_MIB` sets `app.slice`'s `dmem.max` to VRAM less that many MiB, which then stay with everything outside `app.slice`:
+Off by default, and mostly not needed with `session.slice` protected. It keeps VRAM for everything outside `app.slice` in a harder way: `VRAM_RESERVE_MIB` sets `app.slice`'s `dmem.max` to VRAM less that many MiB, which then stay with the rest:
 
 ```
 [Service]
@@ -66,6 +77,7 @@ DRM key:          drm/0000:2d:00.0/vram
 VRAM total:       8573157376 (8176 MiB, 7.98 GiB)
 Boost ratio:      90%
 Boosted bytes:    7715841638 (7358 MiB, 7.19 GiB)
+Session low:      8573157376 (8176 MiB, 7.98 GiB)
 App ceiling:      off
 Current unit:     app-flatpak-org.mozilla.firefox-1126565164.scope
 Boosted cgroup:   /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-org.mozilla.firefox-1126565164.scope
@@ -175,7 +187,7 @@ systemctl --user edit umbriel-vram-booster.service
 
 **Daemon fails to start**
 
-Common cause: `dmemcg-booster` is not running, or `dmem` is not in `cgroup.controllers`. The journal names the reason; a `VRAM_BOOST_RATIO` that is not a number above 0 and at most 1, or a `VRAM_RESERVE_MIB` that is not a whole number below the VRAM size, stops it too.
+Common cause: `dmemcg-booster` is not running, or `dmem` is not in `cgroup.controllers`. The journal names the reason; a `VRAM_BOOST_RATIO` that is not a number above 0 and at most 1, a `VRAM_PROTECT_SESSION` other than 0 or 1, or a `VRAM_RESERVE_MIB` that is not a whole number below the VRAM size, stops it too.
 
 **"Failed to boost ... dmem.low missing"**
 

@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::time::{Duration, Instant};
-use tracing::warn;
+use tracing::{info, warn};
 
 pub(crate) fn parse_dmem_capacity(content: &str) -> Vec<(String, u64)> {
     content
@@ -143,15 +143,15 @@ impl DmemWriter {
         .await
     }
 
-    /// Set `dmem.max` of `cgroup_dir` for `drm_key`; None lifts it.
-    pub(crate) async fn write_max(
+    /// Set the dmem file `name` of `cgroup_dir` to `value` for `drm_key`.
+    pub(crate) async fn write_value(
         &self,
         cgroup_dir: &str,
+        name: &str,
         drm_key: &str,
-        bytes: Option<u64>,
+        value: &str,
     ) -> std::io::Result<WriteOutcome> {
-        let value = bytes.map_or_else(|| "max".to_string(), |b| b.to_string());
-        self.queue(cgroup_dir, "dmem.max", format!("{drm_key} {value}\n"), true)
+        self.queue(cgroup_dir, name, format!("{drm_key} {value}\n"), true)
             .await
     }
 
@@ -178,6 +178,143 @@ impl DmemWriter {
             Ok(result) => result.map_err(|_| gone())?,
             Err(_) => Ok(WriteOutcome::TimedOut),
         }
+    }
+}
+
+/// Where a [`SliceSetting`] stands, as last seen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SliceState {
+    /// Not looked at yet, the slice has no such file for the GPU, or the
+    /// write did not finish.
+    Unknown,
+    /// The slice holds this daemon's value.
+    Held,
+    /// Written, but the old value stayed: a kernel before 7.3 refuses a
+    /// `dmem.max` below what the slice already uses, without an error.
+    Refused,
+    /// The write failed.
+    Failed,
+    /// The slice has a value of someone else's, which is left alone.
+    Foreign,
+}
+
+/// A dmem value this daemon keeps on one of this user's slices: the
+/// protection of session.slice, or the ceiling on app.slice. It is written
+/// only where the file holds its unset value, left alone where someone else
+/// set it, and put back at exit while it is still this daemon's. Checked at
+/// every focus change rather than once: the slices are made anew when the
+/// user manager restarts, and a refused value is worth trying again.
+pub(crate) struct SliceSetting {
+    /// What it is, for the log.
+    pub(crate) what: &'static str,
+    pub(crate) dir: String,
+    pub(crate) file: &'static str,
+    /// What the file holds when nobody set it.
+    pub(crate) unset: &'static str,
+    pub(crate) value: u64,
+    pub(crate) state: SliceState,
+}
+
+impl SliceSetting {
+    /// dmem.low of session.slice, where the compositor usually runs.
+    pub(crate) fn session_protection(session_slice: &str, value: u64) -> Self {
+        Self {
+            what: "the protection of session.slice",
+            dir: session_slice.to_string(),
+            file: "dmem.low",
+            unset: "0",
+            value,
+            state: SliceState::Unknown,
+        }
+    }
+
+    /// dmem.max of app.slice.
+    pub(crate) fn ceiling(app_slice: &str, value: u64) -> Self {
+        Self {
+            what: "the ceiling on app.slice",
+            dir: app_slice.to_string(),
+            file: "dmem.max",
+            unset: "max",
+            value,
+            state: SliceState::Unknown,
+        }
+    }
+
+    async fn current(&self, drm_key: &str) -> Option<String> {
+        let content = tokio::fs::read_to_string(format!("{}/{}", self.dir, self.file))
+            .await
+            .ok()?;
+        dmem_entry(&content, drm_key).map(str::to_string)
+    }
+
+    pub(crate) async fn ensure(&mut self, writer: &DmemWriter, drm_key: &str) {
+        let ours = self.value.to_string();
+        let state = match self.current(drm_key).await.as_deref() {
+            None => SliceState::Unknown,
+            Some(v) if v == ours => SliceState::Held,
+            Some(v) if v == self.unset => {
+                match writer
+                    .write_value(&self.dir, self.file, drm_key, &ours)
+                    .await
+                {
+                    Ok(WriteOutcome::Wrote) => {
+                        if self.current(drm_key).await.as_deref() == Some(ours.as_str()) {
+                            SliceState::Held
+                        } else {
+                            SliceState::Refused
+                        }
+                    }
+                    Ok(_) => SliceState::Unknown,
+                    Err(e) => {
+                        if self.state != SliceState::Failed {
+                            warn!("cannot set {}: {e}", self.what);
+                        }
+                        SliceState::Failed
+                    }
+                }
+            }
+            Some(v) => {
+                if self.state != SliceState::Foreign {
+                    warn!(
+                        "{}/{} is {} for {drm_key}, not this daemon's; leaving it alone",
+                        self.dir,
+                        self.file,
+                        crate::loggable(v)
+                    );
+                }
+                SliceState::Foreign
+            }
+        };
+        if state != self.state {
+            match state {
+                SliceState::Held => info!("set {}: {}={}", self.what, self.file, self.value),
+                SliceState::Refused => info!(
+                    "the kernel kept {}/{} as it was, since the slice uses more than {} bytes; trying again at the next focus change",
+                    self.dir, self.file, self.value
+                ),
+                _ => {}
+            }
+        }
+        self.state = state;
+    }
+
+    /// Put the unset value back, if the file still holds this daemon's.
+    pub(crate) async fn restore(&mut self, writer: &DmemWriter, drm_key: &str) {
+        if self.current(drm_key).await != Some(self.value.to_string()) {
+            return;
+        }
+        match writer
+            .write_value(&self.dir, self.file, drm_key, self.unset)
+            .await
+        {
+            Ok(WriteOutcome::Wrote) => info!("took off {}", self.what),
+            Ok(WriteOutcome::Missing) => {}
+            Ok(WriteOutcome::TimedOut) => {
+                warn!("taking off {} did not finish in 2 s", self.what)
+            }
+            Err(e) => warn!("cannot take off {}: {e}", self.what),
+        }
+        self.state = SliceState::Unknown;
     }
 }
 
@@ -457,6 +594,53 @@ mod tests {
         assert!(!dmem_low_has_value(body, "drm/0000:2d:00.0/vram", 0));
         assert!(!dmem_low_has_value(body, "drm/other/vram", 7715841638));
         assert!(!dmem_low_has_value("", "drm/0000:2d:00.0/vram", 7715841638));
+    }
+
+    /// The slice files are ordinary files here: a setting goes where the file
+    /// is unset, stays off one someone else set, and is put back at exit
+    /// only while it is this daemon's.
+    #[tokio::test]
+    async fn a_slice_setting_goes_only_where_nobody_else_set_one() {
+        let dir = std::env::temp_dir().join(format!("uvb-slice-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_string_lossy().into_owned();
+        let key = "drm/0000:2d:00.0/vram";
+        let writer = DmemWriter::new(Duration::from_secs(2));
+
+        for (mut setting, unset) in [
+            (SliceSetting::ceiling(&path, 900), "max"),
+            (SliceSetting::session_protection(&path, 1000), "0"),
+        ] {
+            let file = dir.join(setting.file);
+            let ours = setting.value;
+
+            // no such file yet: nothing is written
+            setting.ensure(&writer, key).await;
+            assert_eq!(setting.state, SliceState::Unknown);
+            assert!(!file.exists());
+
+            fs::write(&file, format!("{key} {unset}\n")).unwrap();
+            setting.ensure(&writer, key).await;
+            assert_eq!(setting.state, SliceState::Held);
+            assert_eq!(
+                fs::read_to_string(&file).unwrap(),
+                format!("{key} {ours}\n")
+            );
+
+            setting.restore(&writer, key).await;
+            assert_eq!(
+                fs::read_to_string(&file).unwrap(),
+                format!("{key} {unset}\n")
+            );
+
+            fs::write(&file, format!("{key} 500\n")).unwrap();
+            setting.ensure(&writer, key).await;
+            assert_eq!(setting.state, SliceState::Foreign);
+            setting.restore(&writer, key).await;
+            assert_eq!(fs::read_to_string(&file).unwrap(), format!("{key} 500\n"));
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A FIFO as `dmem.low` blocks a write until someone reads it, which is a

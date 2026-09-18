@@ -12,7 +12,7 @@ mod matcher;
 mod umbriel;
 
 use cgroup::{
-    DmemWriter, WriteOutcome, cgroup_path_for_pid, cleanup_stale_boosts, current_uid, dmem_entry,
+    DmemWriter, SliceSetting, WriteOutcome, cgroup_path_for_pid, cleanup_stale_boosts, current_uid,
     dmem_low_is, find_app_scope_for_pid, pid_comm, read_dmem_capacity, unit_label,
 };
 use matcher::find_app_scope_for_app_id;
@@ -78,27 +78,27 @@ fn ceiling_for(vram_total: u64, reserve_mib: u64) -> Result<Option<u64>, String>
     }
 }
 
-/// Where the ceiling on app.slice stands, as last seen.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ceiling {
-    /// Not looked at yet, or app.slice has no dmem.max for the GPU.
-    Unknown,
-    /// app.slice holds this daemon's ceiling.
-    Held,
-    /// Written, but the old limit stayed: a kernel before 7.3 refuses a
-    /// limit below what app.slice already uses, without an error.
-    Refused,
-    /// The write failed.
-    Failed,
-    /// app.slice has a limit of someone else's, which is left alone.
-    Foreign,
+/// Whether session.slice gets a dmem.low of the whole VRAM; on unless
+/// VRAM_PROTECT_SESSION=0.
+fn read_protect_session() -> Result<bool, String> {
+    match std::env::var("VRAM_PROTECT_SESSION").as_deref() {
+        Ok("1") | Err(std::env::VarError::NotPresent) => Ok(true),
+        Ok("0") => Ok(false),
+        Ok(v) => Err(format!(
+            "VRAM_PROTECT_SESSION={} is neither 0 nor 1",
+            loggable(v)
+        )),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("VRAM_PROTECT_SESSION is neither 0 nor 1".to_string())
+        }
+    }
 }
 
 /// Trim a string that came from a window or another process before it goes
 /// into a log line: control characters would let any app forge journal
 /// entries, and an overlong id would bury the rest of the line. The cap is
 /// 255, the longest a unit or cgroup name can be, so those are never cut.
-fn loggable(raw: &str) -> String {
+pub(crate) fn loggable(raw: &str) -> String {
     let clean: String = raw.chars().filter(|c| !c.is_control()).collect();
     match clean.char_indices().nth(255) {
         Some((i, _)) => format!("{}\u{2026}", &clean[..i]),
@@ -149,11 +149,8 @@ struct Inner {
     drm_key: String,
     vram_total: u64,
     boost_ratio: f64,
-    /// dmem.max for app.slice, None when the ceiling is off.
-    ceiling: Option<u64>,
-    ceiling_state: Ceiling,
-    /// This user's app.slice, where the ceiling goes.
-    app_slice: String,
+    /// What this daemon keeps on session.slice and app.slice.
+    slices: Vec<SliceSetting>,
     writer: DmemWriter,
     /// Where PropertiesChanged is queued, once the bus connection is up.
     changes: Option<tokio::sync::mpsc::UnboundedSender<Changes>>,
@@ -192,95 +189,24 @@ impl Inner {
         (self.vram_total as f64 * self.boost_ratio) as u64
     }
 
-    /// What app.slice's dmem.max holds for the GPU, if it has one.
-    async fn app_slice_max(&self) -> Option<String> {
-        let content = tokio::fs::read_to_string(format!("{}/dmem.max", self.app_slice))
-            .await
-            .ok()?;
-        dmem_entry(&content, &self.drm_key).map(str::to_string)
+    async fn ensure_slices(&mut self) {
+        for setting in &mut self.slices {
+            setting.ensure(&self.writer, &self.drm_key).await;
+        }
     }
 
-    /// Put the ceiling on app.slice unless it is there. Checked at every
-    /// focus change rather than once: app.slice is made anew when the user
-    /// manager restarts, and a refused ceiling is worth trying again once
-    /// app.slice uses less. A limit someone else set is left alone.
-    async fn ensure_ceiling(&mut self) {
-        let Some(ceiling) = self.ceiling else {
-            return;
-        };
-        let ours = ceiling.to_string();
-        let state = match self.app_slice_max().await.as_deref() {
-            None => Ceiling::Unknown,
-            Some(v) if v == ours => Ceiling::Held,
-            Some("max") => {
-                match self
-                    .writer
-                    .write_max(&self.app_slice, &self.drm_key, Some(ceiling))
-                    .await
-                {
-                    Ok(WriteOutcome::Wrote) => {
-                        if self.app_slice_max().await.as_deref() == Some(ours.as_str()) {
-                            Ceiling::Held
-                        } else {
-                            Ceiling::Refused
-                        }
-                    }
-                    Ok(_) => Ceiling::Unknown,
-                    Err(e) => {
-                        if self.ceiling_state != Ceiling::Failed {
-                            warn!("cannot set dmem.max on app.slice: {e}");
-                        }
-                        Ceiling::Failed
-                    }
-                }
-            }
-            Some(v) => {
-                if self.ceiling_state != Ceiling::Foreign {
-                    warn!(
-                        "app.slice already has dmem.max={} for {}, not this daemon's; leaving it alone",
-                        loggable(v),
-                        self.drm_key
-                    );
-                }
-                Ceiling::Foreign
-            }
-        };
-        if state != self.ceiling_state {
-            match state {
-                Ceiling::Held => info!(
-                    "app.slice capped at dmem.max={ceiling}, {} MiB short of VRAM",
-                    (self.vram_total - ceiling) / 1024 / 1024
-                ),
-                Ceiling::Refused => info!(
-                    "app.slice uses more VRAM than the ceiling of {ceiling} bytes and the kernel kept it unlimited; trying again at the next focus change"
-                ),
-                _ => {}
-            }
+    async fn restore_slices(&mut self) {
+        for setting in &mut self.slices {
+            setting.restore(&self.writer, &self.drm_key).await;
         }
-        self.ceiling_state = state;
     }
 
-    /// Take the ceiling off app.slice, if it is this daemon's.
-    async fn lift_ceiling(&mut self) {
-        let Some(ceiling) = self.ceiling else {
-            return;
-        };
-        if self.app_slice_max().await != Some(ceiling.to_string()) {
-            return;
-        }
-        match self
-            .writer
-            .write_max(&self.app_slice, &self.drm_key, None)
-            .await
-        {
-            Ok(WriteOutcome::Wrote) => info!("lifted the ceiling on app.slice"),
-            Ok(WriteOutcome::Missing) => {}
-            Ok(WriteOutcome::TimedOut) => {
-                warn!("lifting the ceiling on app.slice did not finish in 2 s")
-            }
-            Err(e) => warn!("cannot lift the ceiling on app.slice: {e}"),
-        }
-        self.ceiling_state = Ceiling::Unknown;
+    /// The value this daemon keeps in `file` of a slice; 0 when it keeps none.
+    fn slice_value(&self, file: &str) -> u64 {
+        self.slices
+            .iter()
+            .find(|s| s.file == file)
+            .map_or(0, |s| s.value)
     }
 
     async fn clear_boost(&mut self) {
@@ -332,7 +258,7 @@ impl Inner {
     }
 
     async fn handle_focus(&mut self, cgroup: Option<String>, source: &str) -> bool {
-        self.ensure_ceiling().await;
+        self.ensure_slices().await;
         let Some(cgroup) = cgroup else {
             if self.boosted_cgroup.is_some() {
                 info!("{source} has no app.slice unit; clearing the boost");
@@ -640,7 +566,13 @@ impl VramBoosterService {
     /// dmem.max this daemon puts on app.slice; 0 when the ceiling is off.
     #[zbus(property(emits_changed_signal = "const"))]
     async fn app_slice_ceiling(&self) -> u64 {
-        self.inner.lock().await.ceiling.unwrap_or(0)
+        self.inner.lock().await.slice_value("dmem.max")
+    }
+
+    /// dmem.low this daemon puts on session.slice; 0 when it puts none.
+    #[zbus(property(emits_changed_signal = "const"))]
+    async fn session_slice_low(&self) -> u64 {
+        self.inner.lock().await.slice_value("dmem.low")
     }
 
     #[zbus(property)]
@@ -674,6 +606,7 @@ async fn main() {
 
     let boost_ratio = read_boost_ratio().unwrap_or_else(|e| die_config(&e));
     let reserve_mib = read_reserve_mib().unwrap_or_else(|e| die_config(&e));
+    let protect_session = read_protect_session().unwrap_or_else(|e| die_config(&e));
     let (drm_key, vram_total) = match read_dmem_capacity() {
         Ok(v) => v,
         Err(e) => die(&e),
@@ -681,7 +614,7 @@ async fn main() {
     let ceiling = ceiling_for(vram_total, reserve_mib).unwrap_or_else(|e| die_config(&e));
     let boost_bytes = (vram_total as f64 * boost_ratio) as u64;
     info!(
-        "GPU {drm_key}, VRAM {} MiB, boost {boost_bytes} bytes ({:.0}% of it), app.slice ceiling {}",
+        "GPU {drm_key}, VRAM {} MiB, boost {boost_bytes} bytes ({:.0}% of it), session.slice protected: {protect_session}, app.slice ceiling {}",
         vram_total / 1024 / 1024,
         boost_ratio * 100.0,
         match ceiling {
@@ -694,10 +627,22 @@ async fn main() {
         die("cannot read /proc/self, so this session's uid is unknown");
     };
     let user_root = std::path::PathBuf::from(format!("/sys/fs/cgroup/user.slice/user-{uid}.slice"));
+    let manager = user_root.join(format!("user@{uid}.service"));
     let scope = Arc::new(Scope {
-        app_slice: user_root.join(format!("user@{uid}.service/app.slice")),
+        app_slice: manager.join("app.slice"),
         user_root,
     });
+    let mut slices = Vec::new();
+    if protect_session {
+        let session_slice = manager.join("session.slice");
+        slices.push(SliceSetting::session_protection(
+            &session_slice.to_string_lossy(),
+            vram_total,
+        ));
+    }
+    if let Some(c) = ceiling {
+        slices.push(SliceSetting::ceiling(&scope.app_slice.to_string_lossy(), c));
+    }
 
     let overridden = Arc::new(AtomicBool::new(false));
     let cleanup_key = drm_key.clone();
@@ -709,9 +654,7 @@ async fn main() {
         drm_key,
         vram_total,
         boost_ratio,
-        ceiling,
-        ceiling_state: Ceiling::Unknown,
-        app_slice: scope.app_slice.to_string_lossy().into_owned(),
+        slices,
         writer: DmemWriter::new(Duration::from_secs(2)),
         changes: None,
         announced: Default::default(),
@@ -759,7 +702,7 @@ async fn main() {
             scope.user_root.display()
         );
     }
-    inner.lock().await.ensure_ceiling().await;
+    inner.lock().await.ensure_slices().await;
 
     info!("ready on the session bus as org.umbriel.VramBooster");
     let follower = tokio::spawn(follow_umbriel(inner.clone(), scope.clone(), overridden));
@@ -784,7 +727,7 @@ async fn main() {
     let mut guard = inner.lock().await;
     follower.abort();
     guard.clear_boost().await;
-    guard.lift_ceiling().await;
+    guard.restore_slices().await;
     info!("cleanup done, exiting");
 }
 
@@ -809,9 +752,7 @@ mod tests {
             drm_key: key.to_string(),
             vram_total: 100,
             boost_ratio: 0.9,
-            ceiling: None,
-            ceiling_state: Ceiling::Unknown,
-            app_slice: String::new(),
+            slices: Vec::new(),
             writer: DmemWriter::new(Duration::from_millis(100)),
             changes: None,
             announced: Default::default(),
@@ -830,62 +771,6 @@ mod tests {
             .expect("the FIFO never saw both writes")
             .unwrap();
         assert_eq!(seen, format!("{key} 90\n{key} 0\n"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// app.slice's dmem.max is an ordinary file here: the ceiling goes onto
-    /// an unlimited app.slice, stays off one limited by someone else, and is
-    /// lifted at exit only while it is this daemon's.
-    #[tokio::test]
-    async fn the_ceiling_goes_only_where_nobody_else_set_one() {
-        let dir = std::env::temp_dir().join(format!("uvb-ceiling-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let max = dir.join("dmem.max");
-        let key = "drm/0000:2d:00.0/vram";
-        let mut inner = Inner {
-            boosted_cgroup: None,
-            unconfirmed: None,
-            current_unit: String::new(),
-            following: String::new(),
-            drm_key: key.to_string(),
-            vram_total: 1000,
-            boost_ratio: 0.9,
-            ceiling: Some(900),
-            ceiling_state: Ceiling::Unknown,
-            app_slice: dir.to_string_lossy().into_owned(),
-            writer: DmemWriter::new(Duration::from_secs(2)),
-            changes: None,
-            announced: Default::default(),
-        };
-
-        // no dmem.max yet: nothing is written
-        inner.ensure_ceiling().await;
-        assert_eq!(inner.ceiling_state, Ceiling::Unknown);
-        assert!(!max.exists());
-
-        std::fs::write(&max, format!("{key} max\n")).unwrap();
-        inner.ensure_ceiling().await;
-        assert_eq!(inner.ceiling_state, Ceiling::Held);
-        assert_eq!(
-            std::fs::read_to_string(&max).unwrap(),
-            format!("{key} 900\n")
-        );
-
-        inner.lift_ceiling().await;
-        assert_eq!(
-            std::fs::read_to_string(&max).unwrap(),
-            format!("{key} max\n")
-        );
-
-        std::fs::write(&max, format!("{key} 500\n")).unwrap();
-        inner.ensure_ceiling().await;
-        assert_eq!(inner.ceiling_state, Ceiling::Foreign);
-        inner.lift_ceiling().await;
-        assert_eq!(
-            std::fs::read_to_string(&max).unwrap(),
-            format!("{key} 500\n")
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -909,9 +794,7 @@ mod tests {
             drm_key: String::new(),
             vram_total: 0,
             boost_ratio: 0.9,
-            ceiling: None,
-            ceiling_state: Ceiling::Unknown,
-            app_slice: String::new(),
+            slices: Vec::new(),
             writer: DmemWriter::new(Duration::from_secs(2)),
             changes: Some(changes),
             announced: Default::default(),
