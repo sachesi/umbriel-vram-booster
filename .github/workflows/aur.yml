@@ -1,0 +1,71 @@
+name: AUR
+
+# A release tag updates the umbriel-vram-booster package on the AUR from
+# packaging/aur/PKGBUILD, once CI has passed (ci.yml calls this). Run by hand, it builds
+# the given version and pushes it only when asked to.
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Released version to build, without the v
+        required: true
+      pkgrel:
+        description: Package release, raised for a fix to the packaging alone
+        default: "1"
+      push:
+        description: Push the result to the AUR
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  aur:
+    name: Update the AUR package
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    # AUR_SSH_KEY lives in this environment, not in the repository; a caller cannot pass
+    # it, and does not need to.
+    environment: aur
+    env:
+      PKGNAME: umbriel-vram-booster
+      VERSION: ${{ inputs.version || github.ref_name }}
+      PKGREL: ${{ inputs.pkgrel || '1' }}
+      # ssh takes its directory from root's passwd entry, not from the job's HOME.
+      GIT_SSH_COMMAND: ssh -i /aur-ssh/key -o IdentitiesOnly=yes -o UserKnownHostsFile=/aur-ssh/known_hosts -o StrictHostKeyChecking=yes
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Set up
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          pacman -Syu --noconfirm --needed git openssh pacman-contrib
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          [ -n "$AUR_SSH_KEY" ] || { echo "AUR_SSH_KEY is not set in the aur environment" >&2; exit 1; }
+          install -d -m 700 /aur-ssh
+          printf '%s\n' "$AUR_SSH_KEY" > /aur-ssh/key
+          chmod 600 /aur-ssh/key
+          # The fingerprint published on aur.archlinux.org.
+          echo 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' > /aur-ssh/known_hosts
+      - name: Update the PKGBUILD and build it
+        run: |
+          case "$PKGREL" in ''|*[!0-9]*) echo "pkgrel must be a number: $PKGREL" >&2; exit 1;; esac
+          git clone "ssh://aur@aur.archlinux.org/$PKGNAME.git" aur
+          cp packaging/aur/PKGBUILD aur/
+          sed -i "s/^pkgver=.*/pkgver=${VERSION#v}/; s/^pkgrel=.*/pkgrel=$PKGREL/" aur/PKGBUILD
+          chown -R builder aur
+          su builder -c 'cd aur && updpkgsums && makepkg --printsrcinfo > .SRCINFO && makepkg --syncdeps --noconfirm'
+      - name: Push
+        if: github.event_name == 'push' || inputs.push
+        run: |
+          cd aur
+          # The clone belongs to the build user.
+          git config --global --add safe.directory "$PWD"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then echo "The AUR already has this"; exit 0; fi
+          git -c user.name=sachesi -c user.email=107267487+sachesi@users.noreply.github.com \
+            commit -m "Update to ${VERSION#v}-$PKGREL"
+          git push origin HEAD:master

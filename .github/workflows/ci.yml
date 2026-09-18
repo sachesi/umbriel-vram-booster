@@ -38,3 +38,9 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           manifest-path: daemon/Cargo.toml
+
+  aur:
+    name: AUR
+    needs: [check, deny]
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/aur.yml

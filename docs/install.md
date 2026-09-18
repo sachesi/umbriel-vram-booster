@@ -54,6 +54,9 @@ just install
 
 The daemon finds Umbriel's socket by itself and waits for it if the compositor is not up yet, so the unit is wanted by `default.target` and needs no session hook.
 
+Arch Linux: the AUR package `umbriel-vram-booster`, built from
+[packaging/aur/PKGBUILD](../packaging/aur/PKGBUILD), which each release tag updates.
+
 ## Uninstall
 
 ```
