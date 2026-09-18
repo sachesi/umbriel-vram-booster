@@ -1,7 +1,9 @@
 # umbriel-vram-booster build and install tasks.
 #
 # `build` needs a Rust toolchain; `install` only copies what is already in
-# daemon/target/release, so the two can run on different machines.
+# daemon/target/release, so the two can run on different machines. Run
+# `install`, `uninstall` and `reload` as your user, not under sudo: they call
+# sudo themselves, and manage a user service.
 #
 #   just build
 #   just install
@@ -40,8 +42,14 @@ check-bins:
     @test -x {{bin_src}} && test -x {{ctl_src}} || \
         { echo "error: {{bin_src}} or {{ctl_src}} missing; run 'just build' first (needs a Rust toolchain)" >&2; exit 1; }
 
+# Under sudo, `systemctl --user` reaches root's user manager, not yours.
+[private]
+not-root:
+    @test "$(id -u)" -ne 0 || \
+        { echo "error: run this as your user, not under sudo; it calls sudo itself" >&2; exit 1; }
+
 # Check the kernel, dmemcg-booster and Umbriel this machine runs.
-check-deps:
+check-deps: not-root
     @grep -qw dmem /sys/fs/cgroup/cgroup.controllers || \
         { echo "error: 'dmem' controller missing from /sys/fs/cgroup/cgroup.controllers; needs kernel 6.14+ with dmem cgroup support, 6.15+ for amdgpu" >&2; exit 1; }
     @systemctl is-active --quiet dmemcg-booster.service || \
@@ -62,7 +70,7 @@ install: check-deps check-bins
     @echo "Installed. The daemon follows the Umbriel socket on its own."
 
 # Disable the user service and remove what install put in place.
-uninstall:
+uninstall: not-root
     -systemctl --user disable --now {{binary}}.service
     -sudo rm -f {{bin_dest}} {{ctl_dest}} {{service_dir}}/{{binary}}.service
     -systemctl --user daemon-reload
@@ -70,7 +78,7 @@ uninstall:
     @echo "Uninstalled."
 
 # Reinstall built binaries and restart the daemon.
-reload: check-bins
+reload: not-root check-bins
     sudo install -Dm755 {{bin_src}} {{bin_dest}}
     sudo install -Dm755 {{ctl_src}} {{ctl_dest}}
     systemctl --user restart {{binary}}.service

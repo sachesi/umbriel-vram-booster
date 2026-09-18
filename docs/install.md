@@ -46,7 +46,7 @@ just build
 just install
 ```
 
-`just build` runs `cargo build --release` and needs the Rust toolchain. `just install` never builds: it only checks that `daemon/target/release/` holds the binaries, so a machine without Rust can install binaries built elsewhere. `just install` will:
+`just build` runs `cargo build --release` and needs the Rust toolchain. `just install` never builds: it only checks that `daemon/target/release/` holds the binaries, so a machine without Rust can install binaries built elsewhere. Run it as your user, not with `sudo`: it calls `sudo` itself, and under `sudo` `systemctl --user` reaches root's service manager instead of yours. `just install` will:
 
 - Install the binaries to `/usr/bin/umbriel-vram-booster` and `/usr/bin/umbriel-vram-boosterctl` (needs `sudo`)
 - Install the systemd **user** service to `/usr/lib/systemd/user/` (needs `sudo`)
