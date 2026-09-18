@@ -19,7 +19,7 @@ name = "umbriel-vram-boosterctl"
 path = "src/ctl.rs"
 
 [dependencies]
-zbus = { version = "4", default-features = false, features = ["tokio"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net", "io-util", "fs"] }
 libc = "0.2"
 serde_json = "1"
