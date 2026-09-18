@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
-use zbus::{SignalContext, connection, interface};
+use zbus::object_server::SignalEmitter;
+use zbus::{connection, interface};
 use zvariant::Value;
 
 mod cgroup;
@@ -118,18 +119,22 @@ type Changes = Vec<(&'static str, String)>;
 
 /// Send what `Inner::announce` queues, in order, outside the state lock.
 async fn emit_changes(
-    ctxt: SignalContext<'static>,
+    ctxt: SignalEmitter<'static>,
     mut queue: tokio::sync::mpsc::UnboundedReceiver<Changes>,
 ) {
     let iface = zbus::names::InterfaceName::from_static_str_unchecked("org.umbriel.VramBooster");
     while let Some(changed) = queue.recv().await {
-        let values: Vec<(&str, Value)> = changed
+        let values: HashMap<&str, Value> = changed
             .iter()
             .map(|(name, value)| (*name, Value::from(value.as_str())))
             .collect();
-        let changed: HashMap<&str, &Value> = values.iter().map(|(n, v)| (*n, v)).collect();
-        if let Err(e) =
-            zbus::fdo::Properties::properties_changed(&ctxt, iface.clone(), &changed, &[]).await
+        if let Err(e) = zbus::fdo::Properties::properties_changed(
+            &ctxt,
+            iface.clone(),
+            values,
+            (&[][..]).into(),
+        )
+        .await
         {
             warn!("cannot emit PropertiesChanged: {e}");
         }
@@ -686,7 +691,7 @@ async fn main() {
         },
         Err(e) => die(&format!("cannot set up the session bus connection: {e}")),
     };
-    match SignalContext::new(&bus, "/org/umbriel/VramBooster") {
+    match SignalEmitter::new(&bus, "/org/umbriel/VramBooster") {
         Ok(ctxt) => {
             let (changes, queue) = tokio::sync::mpsc::unbounded_channel();
             tokio::spawn(emit_changes(ctxt, queue));
