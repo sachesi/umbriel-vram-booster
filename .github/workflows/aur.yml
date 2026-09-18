@@ -70,7 +70,8 @@ jobs:
           cd aur
           # The clone belongs to the build user.
           git config --global --add safe.directory "$PWD"
-          git add PKGBUILD .SRCINFO LICENSE
+          # -f: a repository first pushed by hand may ignore everything else in .gitignore.
+          git add -f PKGBUILD .SRCINFO LICENSE
           if git diff --cached --quiet; then echo "The AUR already has this"; exit 0; fi
           git -c user.name=sachesi -c user.email=107267487+sachesi@users.noreply.github.com \
             commit -m "Update to ${VERSION#v}-$PKGREL"
