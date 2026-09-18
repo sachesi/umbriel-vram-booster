@@ -54,17 +54,23 @@ jobs:
         run: |
           case "$PKGREL" in ''|*[!0-9]*) echo "pkgrel must be a number: $PKGREL" >&2; exit 1;; esac
           git clone "ssh://aur@aur.archlinux.org/$PKGNAME.git" aur
-          cp packaging/aur/PKGBUILD aur/
+          cp packaging/aur/PKGBUILD packaging/aur/LICENSE aur/
           sed -i "s/^pkgver=.*/pkgver=${VERSION#v}/; s/^pkgrel=.*/pkgrel=$PKGREL/" aur/PKGBUILD
           chown -R builder aur
-          su builder -c 'cd aur && updpkgsums && makepkg --printsrcinfo > .SRCINFO && makepkg --syncdeps --noconfirm'
+          su builder -c 'cd aur && updpkgsums && makepkg --printsrcinfo > .SRCINFO'
+          # pacman cannot install dependencies that live on the AUR, such as dmemcg-booster;
+          # the build does not need them, so install the rest and skip the check.
+          deps=$(sed -n 's/^\t\(make\|check\)\?depends = \([^<>=]*\).*/\2/p' aur/.SRCINFO)
+          repo=$(for d in $deps; do pacman -Sp "$d" >/dev/null 2>&1 && echo "$d"; done)
+          if [ -n "$repo" ]; then pacman -S --noconfirm --needed --asdeps $repo; fi
+          su builder -c 'cd aur && makepkg --nodeps --noconfirm'
       - name: Push
         if: github.event_name == 'push' || inputs.push
         run: |
           cd aur
           # The clone belongs to the build user.
           git config --global --add safe.directory "$PWD"
-          git add PKGBUILD .SRCINFO
+          git add PKGBUILD .SRCINFO LICENSE
           if git diff --cached --quiet; then echo "The AUR already has this"; exit 0; fi
           git -c user.name=sachesi -c user.email=107267487+sachesi@users.noreply.github.com \
             commit -m "Update to ${VERSION#v}-$PKGREL"
