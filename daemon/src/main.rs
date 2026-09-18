@@ -43,9 +43,6 @@ fn read_boost_ratio() -> Result<f64, String> {
     }
 }
 
-/// VRAM that app.slice may never take, unless VRAM_RESERVE_MIB says otherwise.
-const DEFAULT_RESERVE_MIB: u64 = 256;
-
 fn read_reserve_mib() -> Result<u64, String> {
     let invalid = |v: &str| {
         format!(
@@ -55,7 +52,10 @@ fn read_reserve_mib() -> Result<u64, String> {
     };
     match std::env::var("VRAM_RESERVE_MIB") {
         Ok(v) => v.parse().map_err(|_| invalid(&v)),
-        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_RESERVE_MIB),
+        // Off unless asked for: from Linux 7.3 a charge that fails on the
+        // ceiling sends the focused app's new buffers to system memory
+        // rather than evicting background apps, see docs/usage.md.
+        Err(std::env::VarError::NotPresent) => Ok(0),
         Err(std::env::VarError::NotUnicode(v)) => Err(invalid(&v.to_string_lossy())),
     }
 }
