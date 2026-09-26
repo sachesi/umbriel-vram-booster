@@ -11,7 +11,7 @@ use tracing::warn;
 /// else the newest `umbriel-*.sock` in the runtime dir, since a systemd user
 /// service does not always inherit the compositor's environment.
 pub(crate) fn umbriel_socket_path() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("UMBRIEL_SOCKET") {
+    if let Some(p) = std::env::var_os("UMBRIEL_SOCKET").filter(|p| !p.is_empty()) {
         return Some(p.into());
     }
     let run = std::env::var("XDG_RUNTIME_DIR").ok()?;
