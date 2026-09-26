@@ -159,8 +159,10 @@ struct Inner {
     writer: DmemWriter,
     /// Where PropertiesChanged is queued, once the bus connection is up.
     changes: Option<tokio::sync::mpsc::UnboundedSender<Changes>>,
-    /// CurrentUnit, BoostedCgroup and Following as clients last heard them.
-    announced: [String; 3],
+    /// CurrentUnit, BoostedCgroup and Following as clients last heard them,
+    /// which is also what the properties read: a Get never waits behind a
+    /// dmem write that holds the lock on this state.
+    announced: tokio::sync::watch::Sender<[String; 3]>,
 }
 
 impl Inner {
@@ -175,19 +177,19 @@ impl Inner {
             self.boosted_cgroup.clone().unwrap_or_default(),
             self.following.clone(),
         ];
-        if now == self.announced {
-            return;
-        }
-        let changed = ["CurrentUnit", "BoostedCgroup", "Following"]
+        let changed: Changes = ["CurrentUnit", "BoostedCgroup", "Following"]
             .into_iter()
-            .zip(now.iter().zip(&self.announced))
+            .zip(now.iter().zip(self.announced.borrow().iter()))
             .filter(|(_, (value, before))| value != before)
             .map(|(name, (value, _))| (name, value.clone()))
             .collect();
+        if changed.is_empty() {
+            return;
+        }
         if let Some(changes) = &self.changes {
             let _ = changes.send(changed);
         }
-        self.announced = now;
+        self.announced.send_replace(now);
     }
 
     fn boost_bytes(&self) -> u64 {
@@ -204,14 +206,6 @@ impl Inner {
         for setting in &mut self.slices {
             setting.restore(&self.writer, &self.drm_key).await;
         }
-    }
-
-    /// The value this daemon keeps in `file` of a slice; 0 when it keeps none.
-    fn slice_value(&self, file: &str) -> u64 {
-        self.slices
-            .iter()
-            .find(|s| s.file == file)
-            .map_or(0, |s| s.value)
     }
 
     async fn clear_boost(&mut self) {
@@ -515,6 +509,16 @@ struct VramBoosterService {
     scope: Arc<Scope>,
     /// Set after a manual call, so the next Umbriel snapshot replaces it.
     overridden: Arc<AtomicBool>,
+    /// CurrentUnit, BoostedCgroup and Following, as `Inner` last announced them.
+    announced: tokio::sync::watch::Receiver<[String; 3]>,
+    drm_key: String,
+    vram_total: u64,
+    boost_ratio: f64,
+    boosted_bytes: u64,
+    /// dmem.max this daemon puts on app.slice; 0 when the ceiling is off.
+    app_slice_ceiling: u64,
+    /// dmem.low this daemon puts on session.slice; 0 when it puts none.
+    session_slice_low: u64,
 }
 
 #[interface(name = "org.umbriel.VramBooster")]
@@ -540,54 +544,47 @@ impl VramBoosterService {
 
     #[zbus(property)]
     async fn current_unit(&self) -> String {
-        self.inner.lock().await.current_unit.clone()
+        self.announced.borrow()[0].clone()
     }
 
     #[zbus(property)]
     async fn following(&self) -> String {
-        self.inner.lock().await.following.clone()
+        self.announced.borrow()[2].clone()
     }
 
     #[zbus(property(emits_changed_signal = "const"))]
     async fn drm_key(&self) -> String {
-        self.inner.lock().await.drm_key.clone()
+        self.drm_key.clone()
     }
 
     #[zbus(property(emits_changed_signal = "const"))]
     async fn vram_total(&self) -> u64 {
-        self.inner.lock().await.vram_total
+        self.vram_total
     }
 
     #[zbus(property(emits_changed_signal = "const"))]
     async fn boost_ratio(&self) -> f64 {
-        self.inner.lock().await.boost_ratio
+        self.boost_ratio
     }
 
     #[zbus(property(emits_changed_signal = "const"))]
     async fn boosted_bytes(&self) -> u64 {
-        self.inner.lock().await.boost_bytes()
+        self.boosted_bytes
     }
 
-    /// dmem.max this daemon puts on app.slice; 0 when the ceiling is off.
     #[zbus(property(emits_changed_signal = "const"))]
     async fn app_slice_ceiling(&self) -> u64 {
-        self.inner.lock().await.slice_value("dmem.max")
+        self.app_slice_ceiling
     }
 
-    /// dmem.low this daemon puts on session.slice; 0 when it puts none.
     #[zbus(property(emits_changed_signal = "const"))]
     async fn session_slice_low(&self) -> u64 {
-        self.inner.lock().await.slice_value("dmem.low")
+        self.session_slice_low
     }
 
     #[zbus(property)]
     async fn boosted_cgroup(&self) -> String {
-        self.inner
-            .lock()
-            .await
-            .boosted_cgroup
-            .clone()
-            .unwrap_or_default()
+        self.announced.borrow()[1].clone()
     }
 }
 
@@ -688,35 +685,39 @@ async fn main() {
     }
 
     let overridden = Arc::new(AtomicBool::new(false));
-    let cleanup_key = drm_key.clone();
-    let inner = Arc::new(Mutex::new(Inner {
-        boosted_cgroup: None,
-        unconfirmed: None,
-        current_unit: String::new(),
-        following: String::new(),
-        drm_key,
+    let announced = tokio::sync::watch::Sender::default();
+    let heard = announced.subscribe();
+    let service = VramBoosterService {
+        inner: Arc::new(Mutex::new(Inner {
+            boosted_cgroup: None,
+            unconfirmed: None,
+            current_unit: String::new(),
+            following: String::new(),
+            drm_key: drm_key.clone(),
+            vram_total,
+            boost_ratio,
+            slices,
+            writer: DmemWriter::new(Duration::from_secs(2)),
+            changes: None,
+            announced,
+        })),
+        scope: scope.clone(),
+        overridden: overridden.clone(),
+        announced: heard,
+        drm_key: drm_key.clone(),
         vram_total,
         boost_ratio,
-        slices,
-        writer: DmemWriter::new(Duration::from_secs(2)),
-        changes: None,
-        announced: Default::default(),
-    }));
+        boosted_bytes: boost_bytes,
+        app_slice_ceiling: ceiling.unwrap_or(0),
+        session_slice_low: if protect_session { vram_total } else { 0 },
+    };
+    let inner = service.inner.clone();
 
     // The bus name is claimed before anything is written: a second instance
     // has to fail here, while the running one still owns the boost it applied.
     let conn = connection::Builder::session()
         .and_then(|b| b.name("org.umbriel.VramBooster"))
-        .and_then(|b| {
-            b.serve_at(
-                "/org/umbriel/VramBooster",
-                VramBoosterService {
-                    inner: inner.clone(),
-                    scope: scope.clone(),
-                    overridden: overridden.clone(),
-                },
-            )
-        });
+        .and_then(|b| b.serve_at("/org/umbriel/VramBooster", service));
     let bus = match conn {
         Ok(builder) => match builder.build().await {
             Ok(c) => c,
@@ -738,7 +739,7 @@ async fn main() {
         Err(e) => warn!("PropertiesChanged will not be emitted: {e}"),
     }
 
-    let cleared = cleanup_stale_boosts(&scope.user_root, &cleanup_key, boost_bytes);
+    let cleared = cleanup_stale_boosts(&scope.user_root, &drm_key, boost_bytes);
     if cleared > 0 {
         info!(
             "startup cleanup: cleared {cleared} stale boost value(s) under {}",
@@ -865,6 +866,51 @@ mod tests {
             ]
         );
         assert!(queue.try_recv().is_err());
+    }
+
+    /// Properties read what was last announced, not the state itself, so a
+    /// Get answers while a dmem write holds the lock on the state.
+    #[tokio::test]
+    async fn properties_answer_while_the_state_is_locked() {
+        let announced = tokio::sync::watch::Sender::default();
+        let heard = announced.subscribe();
+        let cgroup = "/a/app.slice/app-foo.scope".to_string();
+        let service = VramBoosterService {
+            inner: Arc::new(Mutex::new(Inner {
+                boosted_cgroup: Some(cgroup.clone()),
+                unconfirmed: None,
+                current_unit: "app-foo.scope".to_string(),
+                following: String::new(),
+                drm_key: String::new(),
+                vram_total: 100,
+                boost_ratio: 0.9,
+                slices: Vec::new(),
+                writer: DmemWriter::new(Duration::from_secs(2)),
+                changes: None,
+                announced,
+            })),
+            scope: Arc::new(Scope {
+                user_root: "/a".into(),
+                app_slice: "/a/app.slice".into(),
+            }),
+            overridden: Arc::new(AtomicBool::new(false)),
+            announced: heard,
+            drm_key: String::new(),
+            vram_total: 100,
+            boost_ratio: 0.9,
+            boosted_bytes: 90,
+            app_slice_ceiling: 0,
+            session_slice_low: 100,
+        };
+        service.inner.lock().await.announce();
+
+        let _held = service.inner.lock().await;
+        let read = async { (service.current_unit().await, service.boosted_cgroup().await) };
+        let (unit, boosted) = tokio::time::timeout(Duration::from_secs(1), read)
+            .await
+            .expect("a property read waited for the state lock");
+        assert_eq!(unit, "app-foo.scope");
+        assert_eq!(boosted, cgroup);
     }
 
     #[test]
