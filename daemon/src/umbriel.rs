@@ -66,8 +66,13 @@ pub(crate) async fn read_snapshots<R: AsyncRead + Unpin>(
         };
         match read {
             Ok(_) if line.is_empty() => return None,
-            Ok(_) if !line.ends_with('\n') => {
-                warn!("Umbriel sent more than {MAX_LINE} bytes without a newline; reconnecting");
+            // Short of the limit, the stream ended in the middle of a line.
+            Ok(n) if !line.ends_with('\n') => {
+                if n as u64 == MAX_LINE {
+                    warn!(
+                        "Umbriel sent more than {MAX_LINE} bytes without a newline; reconnecting"
+                    );
+                }
                 return None;
             }
             Ok(_) => {}
