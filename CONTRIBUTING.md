@@ -5,8 +5,9 @@ security problems do not, see [SECURITY.md](SECURITY.md).
 
 Before a change goes in:
 
-- `just check` and `just test` pass. CI runs both on Fedora 44, with `cargo deny check`,
-  for every push and pull request.
+- `just check` and `just test` pass. CI runs both on Fedora 44, with `cargo deny check`
+  and a build with the oldest Rust `daemon/Cargo.toml` allows, for every push and pull
+  request.
 - Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/):
   `fix:`, `feat:`, `docs:`, `build:` and so on, scoped where it helps (`fix(daemon):`,
   `fix(ctl):`, `fix(packaging):`), with a subject that says what changed.
