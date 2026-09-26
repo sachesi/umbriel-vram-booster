@@ -421,7 +421,7 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>, overridden:
                 if !waiting {
                     warn!(
                         "cannot connect to {}: {e}; waiting for Umbriel",
-                        path.display()
+                        loggable(&path.to_string_lossy())
                     );
                     waiting = true;
                 }
@@ -437,7 +437,7 @@ async fn follow_umbriel(inner: Arc<Mutex<Inner>>, scope: Arc<Scope>, overridden:
             tokio::time::sleep(backoff(&mut retry)).await;
             continue;
         }
-        info!("following {}", path.display());
+        info!("following {}", loggable(&path.to_string_lossy()));
         waiting = false;
         retry = FIRST_RETRY;
         {
