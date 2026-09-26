@@ -189,11 +189,11 @@ systemctl --user edit umbriel-vram-booster.service
 
 Common cause: `dmemcg-booster` is not running, or `dmem` is not in `cgroup.controllers`. The journal names the reason; a `VRAM_BOOST_RATIO` that is not a number above 0 and at most 1, a `VRAM_PROTECT_SESSION` other than 0 or 1, or a `VRAM_RESERVE_MIB` that is not a whole number below the VRAM size, stops it too.
 
-**"Failed to boost ... dmem.low missing"**
+**"cannot boost ...: it has no dmem.low"**
 
 The user `dmemcg-booster.service` has not propagated the controller into app units. Check `systemctl --user status dmemcg-booster.service`.
 
-**"app.slice already has dmem.max=..."**
+**".../app.slice/dmem.max is ... not this daemon's; leaving it alone"**
 
 Something else, such as a oneshot service from a VRAM tuning guide, set a limit on `app.slice`. The daemon leaves it; remove the other setup, or leave `VRAM_RESERVE_MIB` unset to keep it.
 
