@@ -591,6 +591,44 @@ impl VramBoosterService {
     }
 }
 
+/// Log to stdout at the level RUST_LOG sets, info when it is unset. Where
+/// stdout is the journal, lines go without colours or a timestamp: the
+/// journal shows neither the one nor needs the other.
+fn init_logging() {
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    use tracing_subscriber::prelude::*;
+
+    let info = || Targets::new().with_default(LevelFilter::INFO);
+    let targets = match std::env::var("RUST_LOG") {
+        Ok(v) => v.parse().unwrap_or_else(|e| {
+            eprintln!("ignoring RUST_LOG={v:?}: {e}");
+            info()
+        }),
+        Err(_) => info(),
+    };
+    let registry = tracing_subscriber::registry().with(targets);
+    let fmt = tracing_subscriber::fmt::layer();
+    if stdout_is_journal() {
+        registry.with(fmt.with_ansi(false).without_time()).init();
+    } else {
+        registry.with(fmt).init();
+    }
+}
+
+/// True when systemd connected stdout to the journal: `JOURNAL_STREAM` then
+/// names its device and inode. The variable alone would also match a program
+/// run from a shell that inherited it.
+fn stdout_is_journal() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Some(stream), Ok(out)) = (
+        std::env::var_os("JOURNAL_STREAM"),
+        std::fs::metadata("/proc/self/fd/1"),
+    ) else {
+        return false;
+    };
+    stream.to_str() == Some(format!("{}:{}", out.dev(), out.ino()).as_str())
+}
+
 fn die(message: &str) -> ! {
     tracing::error!("{message}");
     std::process::exit(1);
@@ -607,7 +645,7 @@ fn die_config(message: &str) -> ! {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    init_logging();
 
     let boost_ratio = read_boost_ratio().unwrap_or_else(|e| die_config(&e));
     let reserve_mib = read_reserve_mib().unwrap_or_else(|e| die_config(&e));
