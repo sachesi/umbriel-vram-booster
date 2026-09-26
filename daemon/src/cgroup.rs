@@ -415,7 +415,10 @@ pub(crate) fn cleanup_stale_boosts(
                 if dmem_low_has_value(&content, drm_key, boost_bytes) {
                     match fs::write(&path, format!("{drm_key} 0\n")) {
                         Ok(()) => *cleared += 1,
-                        Err(e) => warn!("startup cleanup: failed to clear {}: {e}", path.display()),
+                        Err(e) => warn!(
+                            "startup cleanup: failed to clear {}: {e}",
+                            crate::loggable(&path.to_string_lossy())
+                        ),
                     }
                 }
             }
