@@ -734,6 +734,9 @@ async fn main() {
     guard.clear_boost().await;
     guard.restore_slices().await;
     info!("cleanup done, exiting");
+    // With the lock still held: returning would release it before the
+    // runtime stops, and a FocusWindow call waiting on it could boost again.
+    std::process::exit(0);
 }
 
 #[cfg(test)]
