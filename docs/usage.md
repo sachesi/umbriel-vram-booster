@@ -10,7 +10,7 @@ The daemon also protects `session.slice`, and can put a ceiling on `app.slice` a
 
 The GPU is the largest `drm/` entry in `/sys/fs/cgroup/dmem.capacity`; set `DRM_KEY` in the unit to pick another one.
 
-If the daemon is killed without cleaning up (`SIGKILL`, a crash), a boost can be left behind. At startup it clears every `dmem.low` under `app.slice` in its own `user-<uid>.slice` that holds exactly its own boost value for the selected GPU; any other value is left alone.
+If the daemon is killed without cleaning up (`SIGKILL`, a crash), a boost can be left behind. At startup it clears the `dmem.low` of every unit under `app.slice` in its own `user-<uid>.slice` that holds exactly its own boost value for the selected GPU; any other value, and any slice, is left alone.
 
 A ratio of 0.90 is aggressive: it leaves little headroom for the compositor and other GPU users. Lower it (0.80, say) if the compositor stutters or background apps are evicted. Override it in the systemd user service, not by running a second copy of the daemon by hand: the running instance owns the bus name, so a second one exits without doing anything.
 

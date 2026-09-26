@@ -384,6 +384,8 @@ pub(crate) fn current_uid() -> Option<u32> {
 /// or SIGKILLed daemon. Only clears app.slice scopes whose value for the selected
 /// drm_key equals our boost value; unrelated values are left untouched. Scoped to
 /// `root` (our own user-<uid>.slice) to avoid touching other users' cgroups.
+/// Slices are skipped: none is ever boosted, and dmemcg-booster gives app.slice
+/// a dmem.low of the whole VRAM, which a ratio of 1 would take for a boost.
 pub(crate) fn cleanup_stale_boosts(
     root: &std::path::Path,
     drm_key: &str,
@@ -402,7 +404,10 @@ pub(crate) fn cleanup_stale_boosts(
             };
             if ft.is_dir() {
                 walk(&path, drm_key, boost_bytes, cleared);
-            } else if entry.file_name() == "dmem.low" && is_app_scope(&path.to_string_lossy()) {
+            } else if entry.file_name() == "dmem.low"
+                && is_app_scope(&path.to_string_lossy())
+                && !dir.to_string_lossy().ends_with(".slice")
+            {
                 let content = match fs::read_to_string(&path) {
                     Ok(c) => c,
                     Err(_) => continue,
@@ -594,6 +599,36 @@ mod tests {
         assert!(!dmem_low_has_value(body, "drm/0000:2d:00.0/vram", 0));
         assert!(!dmem_low_has_value(body, "drm/other/vram", 7715841638));
         assert!(!dmem_low_has_value("", "drm/0000:2d:00.0/vram", 7715841638));
+    }
+
+    #[test]
+    fn startup_cleanup_clears_stale_boosts_but_never_a_slice() {
+        let root = std::env::temp_dir().join(format!("uvb-cleanup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let app = root.join("user@1000.service/app.slice");
+        let key = "drm/0000:2d:00.0/vram";
+        let boost = 8573157376;
+        for (dir, value) in [
+            // what dmemcg-booster puts there, equal to the boost at a ratio of 1
+            (app.clone(), boost),
+            (app.join("app-foo.scope"), boost),
+            (app.join("app-bar.scope"), 5),
+            (root.join("user@1000.service/session.slice"), boost),
+        ] {
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("dmem.low"), format!("{key} {value}\n")).unwrap();
+        }
+
+        assert_eq!(cleanup_stale_boosts(&root, key, boost), 1);
+        let low = |dir: &std::path::Path| fs::read_to_string(dir.join("dmem.low")).unwrap();
+        assert_eq!(low(&app.join("app-foo.scope")), format!("{key} 0\n"));
+        assert_eq!(low(&app), format!("{key} {boost}\n"));
+        assert_eq!(low(&app.join("app-bar.scope")), format!("{key} 5\n"));
+        assert_eq!(
+            low(&root.join("user@1000.service/session.slice")),
+            format!("{key} {boost}\n")
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The slice files are ordinary files here: a setting goes where the file
