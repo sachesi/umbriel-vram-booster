@@ -22,9 +22,11 @@ https://pixelcluster.github.io/VRAM-Mgmt-fixed/
 Enable and start both the system service (propagates dmem into user session cgroups) and the user service (propagates dmem into app scopes):
 
 ```
-sudo systemctl enable --now dmemcg-booster.service
-systemctl --user enable --now dmemcg-booster.service
+sudo systemctl enable --now dmemcg-booster-system.service
+systemctl --user enable --now dmemcg-booster-user.service
 ```
+
+The AUR and COPR packages enable both on install. COPR builds before 0.1.3-2 installed both as `dmemcg-booster.service`, one a system unit and one a user unit.
 
 **3. Umbriel**
 

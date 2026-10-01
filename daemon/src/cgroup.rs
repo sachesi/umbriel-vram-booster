@@ -33,7 +33,7 @@ pub(crate) fn read_dmem_capacity() -> Result<(String, u64), String> {
     let entries = parse_dmem_capacity(&content);
     if entries.is_empty() {
         return Err(
-            "no drm entries in /sys/fs/cgroup/dmem.capacity. Is dmemcg-booster.service running?"
+            "no drm entries in /sys/fs/cgroup/dmem.capacity. Is dmemcg-booster running?"
                 .to_string(),
         );
     }
