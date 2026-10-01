@@ -1,7 +1,10 @@
 [Unit]
 Description=Umbriel VRAM Booster - dynamic dmem cgroup prioritization for the focused app
-After=dmemcg-booster.service
-Wants=dmemcg-booster.service
+# Upstream calls the user half dmemcg-booster-user.service; COPR builds
+# before 0.1.3-2 installed it as dmemcg-booster.service. Either may be missing,
+# which After= and Wants= both ignore.
+After=dmemcg-booster-user.service dmemcg-booster.service
+Wants=dmemcg-booster-user.service dmemcg-booster.service
 
 [Service]
 Type=dbus

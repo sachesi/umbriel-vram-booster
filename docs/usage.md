@@ -191,7 +191,7 @@ Common cause: `dmemcg-booster` is not running, or `dmem` is not in `cgroup.contr
 
 **"cannot boost ...: it has no dmem.low"**
 
-The user `dmemcg-booster.service` has not propagated the controller into app units. Check `systemctl --user status dmemcg-booster.service`.
+`dmemcg-booster-user.service` has not propagated the controller into app units. Check `systemctl --user status dmemcg-booster-user.service`.
 
 **".../app.slice/dmem.max is ... not this daemon's; leaving it alone"**
 
@@ -199,7 +199,7 @@ Something else, such as a oneshot service from a VRAM tuning guide, set a limit 
 
 **"Permission denied" writing dmem.low**
 
-The daemon runs as your user and relies on `dmem.low` under your `user@<uid>.service` subtree being user-writable (set up by the user `dmemcg-booster.service`). If your setup leaves those files root-owned, the user-session model cannot write them — check the `dmemcg-booster` configuration.
+The daemon runs as your user and relies on `dmem.low` under your `user@<uid>.service` subtree being user-writable (set up by `dmemcg-booster-user.service`). If your setup leaves those files root-owned, the user-session model cannot write them — check the `dmemcg-booster` configuration.
 
 **Several units match one app id**
 

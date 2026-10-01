@@ -300,7 +300,7 @@ impl Inner {
             }
             Ok(WriteOutcome::Missing) => {
                 warn!(
-                    "cannot boost {label}: it has no dmem.low. Is the user dmemcg-booster.service running?"
+                    "cannot boost {label}: it has no dmem.low. Is dmemcg-booster-user.service running?"
                 );
                 false
             }
