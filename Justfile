@@ -51,7 +51,7 @@ not-root:
 # Check the kernel, dmemcg-booster and Umbriel this machine runs.
 check-deps: not-root
     @grep -qw dmem /sys/fs/cgroup/cgroup.controllers || \
-        { echo "error: 'dmem' controller missing from /sys/fs/cgroup/cgroup.controllers; needs kernel 6.14+ with dmem cgroup support, 6.15+ for amdgpu" >&2; exit 1; }
+        { echo "error: 'dmem' controller missing from /sys/fs/cgroup/cgroup.controllers; needs kernel 6.14+ with dmem cgroup support (amdgpu from 6.15, NVIDIA's open modules from driver 615)" >&2; exit 1; }
     @systemctl is-active --quiet dmemcg-booster-system.service || systemctl is-active --quiet dmemcg-booster.service || \
         { echo "error: the system dmemcg-booster service is not active; run: sudo systemctl enable --now dmemcg-booster-system.service" >&2; exit 1; }
     @systemctl --user is-active --quiet dmemcg-booster-user.service || systemctl --user is-active --quiet dmemcg-booster.service || \

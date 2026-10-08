@@ -6,10 +6,10 @@ It needs no root at runtime. It is the Umbriel counterpart of [gnome-vram-booste
 
 ## Requirements
 
-- Linux 6.15 or newer, the first where amdgpu reports VRAM to the `dmem` cgroup controller (the controller came in 6.14). Up to 7.2, protection only decides what is evicted when a buffer moves back into VRAM, while a new buffer that finds VRAM full still goes to system memory; from 7.3, or with the patches CachyOS ships, a protected app's new buffer evicts unprotected ones instead, which is where most of the gain is.
+- Linux 6.14 or newer for the `dmem` cgroup controller; amdgpu reports VRAM to it from 6.15, NVIDIA's open kernel modules from driver 615. Up to 7.2, protection only decides what is evicted when a buffer moves back into VRAM, while a new buffer that finds VRAM full still goes to system memory; from 7.3, or with the patches CachyOS ships, a protected app's new buffer evicts unprotected ones instead, which is where most of the gain is.
 - [dmemcg-booster](https://pixelcluster.github.io/VRAM-Mgmt-fixed/), both its system and its user service.
 - Umbriel. A build that reports `pid` in its `windows` events ([#166](https://github.com/noctalia-dev/umbriel/pull/166)) resolves Wayland windows exactly; an older one falls back to matching app ids.
-- An AMD GPU on `amdgpu`. Intel is untested; NVIDIA's proprietary driver is untested and likely lacks dmem support.
+- A GPU whose driver reports VRAM to `dmem`. The daemon accepts any driver's region; known ones are `amdgpu` (6.15+), Intel on `xe` (6.14+) and NVIDIA's open kernel modules (driver 615+). Intel and NVIDIA are untested here. NVIDIA's open modules register a region from driver 610, so the daemon starts there too, but only 615 lets `dmem.low` decide what is evicted; on 610 the boost is written but has little effect.
 - Apps launched into a unit of their own under `app.slice`; see [docs/usage.md](docs/usage.md#apps-must-live-in-appslice).
 
 ## Building and installing
