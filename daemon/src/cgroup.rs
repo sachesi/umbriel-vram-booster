@@ -5,6 +5,23 @@ use std::fs;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
+/// A `dmem.capacity` key naming a device's memory region. The kernel lets each
+/// registrant choose the name (`dmem_cgroup_register_region()` takes a printf
+/// format), so this is not tied to a driver. The in-tree producers all use
+/// `<namespace>/<device>/<region>`: DRM's helper `drm/%s/%s` for amdgpu, xe and
+/// the rest, and NVIDIA's open module `nvidia/<busid>/vidmem`. Any driver's key
+/// of that shape is accepted. A key with no region, or with no device component
+/// (the slash-less `system` region), is not a device region; zero-capacity
+/// regions such as `gtt` and `stolen` are dropped by the value test.
+fn is_gpu_region(key: &str) -> bool {
+    let mut parts = key.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(a), Some(b), Some(c), None)
+            if !a.is_empty() && !b.is_empty() && !c.is_empty()
+    )
+}
+
 pub(crate) fn parse_dmem_capacity(content: &str) -> Vec<(String, u64)> {
     content
         .lines()
@@ -12,7 +29,7 @@ pub(crate) fn parse_dmem_capacity(content: &str) -> Vec<(String, u64)> {
             let mut parts = line.split_whitespace();
             let key = parts.next()?;
             let val: u64 = parts.next()?.parse().ok()?;
-            if key.starts_with("drm/") && val > 0 {
+            if is_gpu_region(key) && val > 0 {
                 Some((key.to_string(), val))
             } else {
                 None
@@ -21,8 +38,8 @@ pub(crate) fn parse_dmem_capacity(content: &str) -> Vec<(String, u64)> {
         .collect()
 }
 
-/// The GPU to boost: the largest drm entry in `dmem.capacity`, or the one
-/// `DRM_KEY` names. The error is the message to show the user, since every
+/// The GPU to boost: the largest GPU memory region in `dmem.capacity`, or the
+/// one `DRM_KEY` names. The error is the message to show the user, since every
 /// failure here has a different cause and a different fix.
 pub(crate) fn read_dmem_capacity() -> Result<(String, u64), String> {
     let content = fs::read_to_string("/sys/fs/cgroup/dmem.capacity").map_err(|e| {
@@ -33,7 +50,7 @@ pub(crate) fn read_dmem_capacity() -> Result<(String, u64), String> {
     let entries = parse_dmem_capacity(&content);
     if entries.is_empty() {
         return Err(
-            "no drm entries in /sys/fs/cgroup/dmem.capacity. Is dmemcg-booster running?"
+            "no GPU memory regions in /sys/fs/cgroup/dmem.capacity. Is dmemcg-booster running, and does the GPU driver expose dmem (amdgpu on kernel 6.15+, xe on 6.14+, NVIDIA's open modules from driver 615)?"
                 .to_string(),
         );
     }
@@ -543,7 +560,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_dmem_capacity_picks_drm_entries() {
+    fn parse_dmem_capacity_picks_gpu_regions() {
         let content = "drm/0000:2d:00.0/vram 8573157376\ndrm/0000:2d:00.0/gtt 0\nsystem 12345\n";
         let entries = parse_dmem_capacity(content);
         assert_eq!(
@@ -553,9 +570,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_dmem_capacity_accepts_any_driver() {
+        // The kernel imposes no naming on a region, so the parser must not
+        // hardcode a driver: any `<namespace>/<device>/<region>` is a card.
+        for key in [
+            "drm/0000:2d:00.0/vram",
+            "nvidia/00000000:01:00.0/vidmem",
+            "nvidia/0000:01:00/vidmem",
+            "future/0000:03:00.0/mem",
+        ] {
+            assert_eq!(
+                parse_dmem_capacity(&format!("{key} 8585740288\n")),
+                vec![(key.to_string(), 8585740288)]
+            );
+        }
+    }
+
+    #[test]
     fn parse_dmem_capacity_ignores_malformed() {
         assert!(parse_dmem_capacity("").is_empty());
         assert!(parse_dmem_capacity("drm/x/vram notanumber\njunk\n").is_empty());
+        // A device without a region, or a bare region, is not a GPU region.
+        assert!(parse_dmem_capacity("drm/0000:2d:00.0 8573157376\nsystem 12345\n").is_empty());
     }
 
     #[test]

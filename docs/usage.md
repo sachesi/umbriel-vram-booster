@@ -8,7 +8,7 @@ The daemon connects to Umbriel's socket (`UMBRIEL_SOCKET`, else `$XDG_RUNTIME_DI
 
 The daemon also protects `session.slice`, and can put a ceiling on `app.slice` as a whole; see [below](#protecting-the-compositor).
 
-The GPU is the largest `drm/` entry in `/sys/fs/cgroup/dmem.capacity`; set `DRM_KEY` in the unit to pick another one.
+The GPU is the largest device-memory region in `/sys/fs/cgroup/dmem.capacity`. The driver is not hardcoded, so any `<namespace>/<device>/<region>` key works — `drm/<busid>/<region>` for `amdgpu` and `xe`, `nvidia/<busid>/vidmem` for NVIDIA's open modules. Set `DRM_KEY` in the unit to pick another one; on a machine with more than one, for example `Environment=DRM_KEY=nvidia/00000000:01:00.0/vidmem`.
 
 If the daemon is killed without cleaning up (`SIGKILL`, a crash), a boost can be left behind. At startup it clears the `dmem.low` of every unit under `app.slice` in its own `user-<uid>.slice` that holds exactly its own boost value for the selected GPU; any other value, and any slice, is left alone.
 
