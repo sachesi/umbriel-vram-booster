@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 use zbus::object_server::SignalEmitter;
+use zbus::zvariant::Value;
 use zbus::{connection, interface};
-use zvariant::Value;
 
 mod cgroup;
 mod matcher;

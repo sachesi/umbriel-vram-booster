@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use zbus::Connection;
-use zvariant::OwnedValue;
+use zbus::zvariant::OwnedValue;
 
 const USAGE: &str = "\
 umbriel-vram-boosterctl - show what umbriel-vram-booster is doing
