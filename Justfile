@@ -14,7 +14,9 @@ binary      := "umbriel-vram-booster"
 ctl         := "umbriel-vram-boosterctl"
 bin_src     := "daemon/target/release/" + binary
 ctl_src     := "daemon/target/release/" + ctl
-bin_dest    := "/usr/bin/" + binary
+bin_dest    := "/usr/libexec/" + binary
+# Where installs up to 0.4.3 put the daemon, removed so that it leaves PATH.
+old_bin     := "/usr/bin/" + binary
 ctl_dest    := "/usr/bin/" + ctl
 service     := "data/" + binary + ".service"
 service_dir := "/usr/lib/systemd/user"
@@ -62,6 +64,7 @@ check-deps: not-root
 # Install the release build and enable the user service. Does not build: run `just build` first.
 install: check-deps check-bins
     sudo install -Dm755 {{bin_src}} {{bin_dest}}
+    sudo rm -f {{old_bin}}
     sudo install -Dm755 {{ctl_src}} {{ctl_dest}}
     sudo install -Dm644 {{service}} {{service_dir}}/{{binary}}.service
     systemctl --user daemon-reload
@@ -72,15 +75,18 @@ install: check-deps check-bins
 # Disable the user service and remove what install put in place.
 uninstall: not-root
     -systemctl --user disable --now {{binary}}.service
-    -sudo rm -f {{bin_dest}} {{ctl_dest}} {{service_dir}}/{{binary}}.service
+    -sudo rm -f {{bin_dest}} {{old_bin}} {{ctl_dest}} {{service_dir}}/{{binary}}.service
     -systemctl --user daemon-reload
     @echo ""
     @echo "Uninstalled."
 
-# Reinstall built binaries and restart the daemon.
+# Reinstall built binaries and the service, and restart the daemon.
 reload: not-root check-bins
     sudo install -Dm755 {{bin_src}} {{bin_dest}}
+    sudo rm -f {{old_bin}}
     sudo install -Dm755 {{ctl_src}} {{ctl_dest}}
+    sudo install -Dm644 {{service}} {{service_dir}}/{{binary}}.service
+    systemctl --user daemon-reload
     systemctl --user restart {{binary}}.service
     @echo "Daemon restarted."
 
