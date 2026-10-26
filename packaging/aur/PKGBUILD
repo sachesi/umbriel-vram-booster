@@ -36,6 +36,10 @@ check() {
 
 package() {
   cd "$pkgname-$pkgver"
-  install -Dm755 daemon/target/release/$pkgname daemon/target/release/${pkgname}ctl -t "$pkgdir/usr/bin"
+  install -Dm755 daemon/target/release/$pkgname -t "$pkgdir/usr/lib/$pkgname"
+  install -Dm755 daemon/target/release/${pkgname}ctl -t "$pkgdir/usr/bin"
   install -Dm644 data/$pkgname.service -t "$pkgdir/usr/lib/systemd/user"
+  # Arch keeps a package's private executables in /usr/lib/$pkgname, not /usr/libexec.
+  sed -i "s|^ExecStart=/usr/libexec/$pkgname$|ExecStart=/usr/lib/$pkgname/$pkgname|" \
+    "$pkgdir/usr/lib/systemd/user/$pkgname.service"
 }

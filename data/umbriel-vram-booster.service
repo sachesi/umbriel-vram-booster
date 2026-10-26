@@ -9,7 +9,7 @@ Wants=dmemcg-booster-user.service dmemcg-booster.service
 [Service]
 Type=dbus
 BusName=org.umbriel.VramBooster
-ExecStart=/usr/bin/umbriel-vram-booster
+ExecStart=/usr/libexec/umbriel-vram-booster
 Environment=RUST_LOG=warn
 # Overrides, best set with `systemctl --user edit`: the share of VRAM to boost
 # (above 0, up to 1), 0 to leave session.slice's dmem.low alone, and how far
